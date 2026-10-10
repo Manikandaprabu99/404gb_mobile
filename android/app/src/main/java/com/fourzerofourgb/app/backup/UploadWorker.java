@@ -7,7 +7,6 @@ import android.os.Build;
 import android.os.SystemClock;
 import android.util.Log;
 import androidx.annotation.NonNull;
-import androidx.work.ExistingWorkPolicy;
 import androidx.work.ForegroundInfo;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
@@ -30,6 +29,7 @@ public final class UploadWorker extends Worker {
     private static final String TAG = "404gb.UploadWorker";
     private static final long NOTIFICATION_INTERVAL_MS = 1000;
     private static final long FOREGROUND_RETRY_MS = 30_000;
+    private static final long RECENT_SCAN_MS = 60_000;
 
     private boolean foreground;
     private long lastForegroundAttempt;
@@ -54,8 +54,12 @@ public final class UploadWorker extends Worker {
             return Result.success();
         }
 
+        prefs.setResumeAt(0L);
         ledger.resetInterrupted();
-        scan(context);
+        // A content-triggered scan usually ran just before this; don't repeat it.
+        if (!MediaScanner.scannedWithin(RECENT_SCAN_MS)) {
+            scan(context);
+        }
 
         ApiClient api = new ApiClient(context, this::isStopped);
         api.setWaitListener(waiting -> BackupStatus.setRateLimited(context, waiting));
@@ -104,7 +108,7 @@ public final class UploadWorker extends Worker {
         } catch (ApiClient.RateLimitedException e) {
             ledger.resetInterrupted();
             // Replaces (and so ends) this run with one that starts after Retry-After.
-            BackupScheduler.enqueueUpload(context, ExistingWorkPolicy.REPLACE, e.retryAfterSeconds * 1000L);
+            BackupScheduler.resumeAfterRateLimit(context, e.retryAfterSeconds * 1000L);
             return Result.success();
         } catch (IOException e) {
             // Network loss, server errors after retries, or WorkManager stopped us.

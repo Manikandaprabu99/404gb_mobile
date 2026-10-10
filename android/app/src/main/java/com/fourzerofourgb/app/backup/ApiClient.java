@@ -98,8 +98,10 @@ final class ApiClient {
     private static final int CONNECT_TIMEOUT_MS = 20_000;
     private static final int READ_TIMEOUT_MS = 120_000;
     private static final int MAX_ATTEMPTS = 4;
-    private static final int MAX_RATE_LIMIT_WAITS = 5;
-    private static final long MAX_INLINE_RETRY_AFTER_SECONDS = 60;
+    // Short waits are slept through in place; longer ones end the run and let
+    // WorkManager start a new one later, so the phone isn't kept awake waiting.
+    private static final int MAX_RATE_LIMIT_WAITS = 3;
+    private static final long MAX_INLINE_RETRY_AFTER_SECONDS = 20;
     private static final int MAX_JSON_BYTES = 2 * 1024 * 1024;
     private static final int MAX_ERROR_BYTES = 64 * 1024;
 

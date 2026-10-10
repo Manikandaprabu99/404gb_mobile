@@ -1,6 +1,11 @@
 package com.fourzerofourgb.app.backup;
 
 import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.os.BatteryManager;
+import android.os.Build;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
@@ -26,6 +31,16 @@ final class BackupStatus {
     static final String STATE_WAITING = "waiting";
     static final String STATE_NEEDS_SIGN_IN = "needs_sign_in";
     static final String STATE_NEEDS_PERMISSION = "needs_permission";
+
+    static final String WAIT_RATE_LIMIT = "rate_limit";
+    static final String WAIT_NETWORK = "network";
+    static final String WAIT_WIFI = "wifi";
+    static final String WAIT_ROAMING = "roaming";
+    static final String WAIT_CHARGING = "charging";
+    static final String WAIT_BATTERY = "battery";
+
+    /** Roughly where Android reports "battery low" (the batteryNotLow constraint). */
+    private static final int LOW_BATTERY_PERCENT = 15;
 
     private static final String TAG = "404gb.BackupStatus";
     private static final long MIN_EMIT_INTERVAL_MS = 250;
@@ -119,7 +134,67 @@ final class BackupStatus {
             status.put("lastBackupAt", JSONObject.NULL);
         }
         status.put("batteryOptimized", isBatteryOptimized(app));
+
+        long resumeAt = prefs.resumeAt();
+        boolean paused = resumeAt > System.currentTimeMillis();
+        String waitingFor = STATE_WAITING.equals(status.optString("state")) ? waitingFor(app, prefs, paused) : null;
+        status.put("waitingFor", waitingFor != null ? waitingFor : JSONObject.NULL);
+        if (paused) {
+            status.put("resumeAt", resumeAt);
+        } else {
+            status.put("resumeAt", JSONObject.NULL);
+        }
         return status;
+    }
+
+    /**
+     * Why queued work isn't running, in the order WorkManager would be blocked
+     * by it: "rate_limit", "network", "wifi", "roaming", "charging", "battery",
+     * or null when nothing obvious is in the way (Android will run it soon).
+     */
+    private static String waitingFor(Context context, BackupPrefs prefs, boolean paused) {
+        if (rateLimited || paused) {
+            return WAIT_RATE_LIMIT;
+        }
+        ConnectivityManager connectivity = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+        NetworkCapabilities caps = null;
+        boolean networkKnown = false;
+        if (connectivity != null) {
+            try {
+                Network network = connectivity.getActiveNetwork();
+                caps = network == null ? null : connectivity.getNetworkCapabilities(network);
+                networkKnown = true;
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Could not read network state", e);
+            }
+        }
+        if (networkKnown) {
+            if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                return WAIT_NETWORK;
+            }
+            if (prefs.wifiOnly() && !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) {
+                return WAIT_WIFI;
+            }
+            if (
+                !prefs.wifiOnly() &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING)
+            ) {
+                return WAIT_ROAMING;
+            }
+        }
+        BatteryManager battery = (BatteryManager) context.getSystemService(Context.BATTERY_SERVICE);
+        if (battery != null) {
+            boolean charging = battery.isCharging();
+            if (prefs.chargingOnly() && !charging) {
+                return WAIT_CHARGING;
+            }
+            int level = battery.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+            if (!charging && level > 0 && level <= LOW_BATTERY_PERCENT) {
+                return WAIT_BATTERY;
+            }
+        }
+        return null;
     }
 
     private static String computeState(Context context, BackupPrefs prefs, BackupLedger.Counts counts) {

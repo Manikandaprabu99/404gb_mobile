@@ -425,6 +425,56 @@ final class BackupLedger extends SQLiteOpenHelper {
         getWritableDatabase().delete(TABLE, KEY_WHERE, keyArgs(item.collection, item.mediaStoreId));
     }
 
+    /**
+     * Records which library ("owner/repo") uploads go to. Returns true when it
+     * changed from a known one, in which case the ledger has been reset.
+     */
+    boolean adoptLibrary(BackupPrefs prefs, String library) {
+        synchronized (BackupLedger.class) {
+            String known = prefs.library();
+            if (known != null && known.equalsIgnoreCase(library)) {
+                return false;
+            }
+            prefs.setLibrary(library);
+            if (known == null) {
+                return false;
+            }
+            resetForNewLibrary();
+            return true;
+        }
+    }
+
+    /**
+     * The phone now backs up into a different repo: what it uploaded or skipped
+     * belongs to the old one, so every backup row goes back in the queue and
+     * saved blob shas (unknown to the new repo) are dropped. Rows for files
+     * saved from the old library are deleted so the next scan queues those
+     * files like any other. The row being uploaded right now is left alone.
+     */
+    private void resetForNewLibrary() {
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            ContentValues values = new ContentValues();
+            values.put(COL_STATE, STATE_PENDING);
+            values.put(COL_ATTEMPTS, 0);
+            values.putNull(COL_MEDIA_ID);
+            values.putNull(COL_CHUNK_SHAS);
+            values.putNull(COL_LAST_ERROR);
+            values.put(COL_UPDATED_AT, System.currentTimeMillis());
+            db.update(
+                TABLE,
+                values,
+                COL_ORIGIN + "=? AND " + COL_STATE + " IN (?,?,?,?)",
+                new String[] { ORIGIN_BACKUP, STATE_PENDING, STATE_DONE, STATE_DUPLICATE, STATE_FAILED }
+            );
+            db.delete(TABLE, COL_ORIGIN + "=?", new String[] { ORIGIN_DOWNLOAD });
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+    }
+
     int retryFailed() {
         ContentValues values = new ContentValues();
         values.put(COL_STATE, STATE_PENDING);

@@ -269,6 +269,31 @@ public class BackupPlugin extends Plugin {
         BackupStatus.changed(context);
     }
 
+    /**
+     * Tells backup which library ("owner/repo") the app is signed in to. When it
+     * differs from the one the phone has been uploading to, everything is
+     * queued again for the new repo.
+     */
+    @PluginMethod
+    public void setLibrary(PluginCall call) {
+        String library = call.getString("repo");
+        if (library == null || !library.trim().matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")) {
+            call.reject("repo must look like \"owner/name\"", "INVALID_ARGUMENT");
+            return;
+        }
+        Context context = getContext();
+        runInBackground(call, () -> {
+            BackupPrefs prefs = BackupPrefs.get(context);
+            boolean changed = BackupLedger.get(context).adoptLibrary(prefs, library.trim());
+            if (changed && prefs.isEnabled()) {
+                BackupScheduler.kickUpload(context);
+                scanSoon();
+            }
+            call.resolve(BackupStatus.build(context));
+            BackupStatus.changed(context);
+        });
+    }
+
     @PluginMethod
     public void retryFailed(PluginCall call) {
         Context context = getContext();

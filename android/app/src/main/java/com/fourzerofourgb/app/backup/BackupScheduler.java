@@ -69,12 +69,17 @@ final class BackupScheduler {
         WorkManager.getInstance(context).enqueueUniqueWork(WORK_MEDIA_TRIGGER, policy, request);
     }
 
-    /** Upload work with the user's Wi-Fi/charging constraints. */
+    /**
+     * Upload work with the user's Wi-Fi/charging choices. Like Google Photos it
+     * never uses mobile data while roaming and pauses while the battery is low
+     * (Android's own low-battery threshold), resuming by itself afterwards.
+     */
     static void enqueueUpload(Context context, ExistingWorkPolicy policy, long delayMillis) {
         BackupPrefs prefs = BackupPrefs.get(context);
         Constraints constraints = new Constraints.Builder()
-            .setRequiredNetworkType(prefs.wifiOnly() ? NetworkType.UNMETERED : NetworkType.CONNECTED)
+            .setRequiredNetworkType(prefs.wifiOnly() ? NetworkType.UNMETERED : NetworkType.NOT_ROAMING)
             .setRequiresCharging(prefs.chargingOnly())
+            .setRequiresBatteryNotLow(true)
             .build();
         OneTimeWorkRequest.Builder builder = new OneTimeWorkRequest.Builder(UploadWorker.class)
             .setConstraints(constraints)
@@ -94,7 +99,14 @@ final class BackupScheduler {
         if (isUploadRunning(context)) {
             return;
         }
+        BackupPrefs.get(context).setResumeAt(0L);
         enqueueUpload(context, ExistingWorkPolicy.REPLACE, 0);
+    }
+
+    /** Ends the current run and starts a new one once GitHub's rate limit has passed. */
+    static void resumeAfterRateLimit(Context context, long delayMillis) {
+        BackupPrefs.get(context).setResumeAt(System.currentTimeMillis() + delayMillis);
+        enqueueUpload(context, ExistingWorkPolicy.REPLACE, delayMillis);
     }
 
     static boolean isUploadRunning(Context context) {

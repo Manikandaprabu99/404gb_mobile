@@ -73,6 +73,7 @@ final class MediaUploader {
 
     private static final String TAG = "404gb.MediaUploader";
     private static final Pattern MEDIA_MIME = Pattern.compile("^(?:image|video)/[a-z0-9.+-]+$");
+    private static final Pattern MEDIA_ID = Pattern.compile("^media_[A-Za-z0-9_-]{1,80}$");
     private static final int MAX_COMMIT_ROUNDS = 3;
 
     private final Context context;
@@ -126,9 +127,18 @@ final class MediaUploader {
             initBody.put("chunkHashes", new JSONArray(hashed.chunkHashes));
             initBody.put("fileHash", hashed.fileHash);
             JSONObject init = api.postJson("/api/media/upload/init", initBody);
+            // Backstop for a repo switch the web app didn't report via setLibrary.
+            String library = ApiClient.optString(init, "library");
+            if (library != null && ledger.adoptLibrary(prefs, library)) {
+                BackupStatus.changed(context);
+            }
             String duplicateOf = ApiClient.optString(init, "duplicateOf");
             if (duplicateOf != null) {
-                return finishExisting(item, duplicateOf, mediaId, hashed.fileHash);
+                Outcome outcome = finishExisting(item, duplicateOf, mediaId, hashed.fileHash);
+                if (init.optBoolean("duplicateNeedsDate", false)) {
+                    fillMissingDate(duplicateOf, item);
+                }
+                return outcome;
             }
             Set<String> toUpload = knownHashes(init.optJSONArray("missing"), hashed);
             toUpload.removeAll(shas.keySet());
@@ -197,6 +207,29 @@ final class MediaUploader {
         }
         ledger.markDuplicate(item, existingId, fileHash);
         return Outcome.DUPLICATE;
+    }
+
+    /**
+     * Best effort: the library copy (an older web upload) has no capture date, so
+     * it sorts under its upload day; give it this file's date. Never overwrites.
+     */
+    private void fillMissingDate(String mediaId, BackupLedger.Item item) throws IOException {
+        long taken = takenMillis(item);
+        if (taken <= 0 || !MEDIA_ID.matcher(mediaId).matches()) {
+            return;
+        }
+        JSObject body = new JSObject();
+        body.put("takenAt", BackupUtil.isoUtc(taken));
+        try {
+            api.postJson("/api/media/" + mediaId + "/taken-at", body);
+        } catch (ApiClient.HttpStatusException e) {
+            Log.w(TAG, "Could not set the capture date of " + mediaId, e);
+        }
+    }
+
+    /** MediaStore DATE_TAKEN (ms), else DATE_MODIFIED (s); 0 when neither is known. */
+    private static long takenMillis(BackupLedger.Item item) {
+        return item.dateTaken > 0 ? item.dateTaken : item.dateModified * 1000L;
     }
 
     /** Chunks a failed commit says must be uploaded again; empty when the error isn't recoverable that way. */
@@ -359,7 +392,7 @@ final class MediaUploader {
         record.put("mimeType", mime);
         record.put("size", hashed.size);
         record.put("createdAt", BackupUtil.isoUtc(System.currentTimeMillis()));
-        long taken = item.dateTaken > 0 ? item.dateTaken : item.dateModified * 1000L;
+        long taken = takenMillis(item);
         if (taken > 0) {
             record.put("takenAt", BackupUtil.isoUtc(taken));
         }

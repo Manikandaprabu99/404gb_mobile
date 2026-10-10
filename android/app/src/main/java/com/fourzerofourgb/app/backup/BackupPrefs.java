@@ -20,6 +20,8 @@ final class BackupPrefs {
     private static final String KEY_NEEDS_SIGN_IN = "needsSignIn";
     private static final String KEY_SIGN_IN_NOTIFIED = "signInNotified";
     private static final String KEY_BATTERY_PROMPTED = "batteryPrompted";
+    private static final String KEY_RESUME_AT = "resumeAt";
+    private static final String KEY_LIBRARY = "library";
 
     private final SharedPreferences prefs;
 
@@ -77,6 +79,16 @@ final class BackupPrefs {
         return prefs.getBoolean(KEY_BATTERY_PROMPTED, false);
     }
 
+    /** When a GitHub rate-limit pause ends (epoch ms); 0 when not paused. */
+    long resumeAt() {
+        return prefs.getLong(KEY_RESUME_AT, 0L);
+    }
+
+    /** "owner/repo" the ledger's uploaded rows belong to, or null before the first upload. */
+    String library() {
+        return prefs.getString(KEY_LIBRARY, null);
+    }
+
     void setOptions(boolean wifiOnly, boolean chargingOnly, String folders) {
         prefs
             .edit()
@@ -128,5 +140,13 @@ final class BackupPrefs {
 
     void setBatteryPrompted(boolean value) {
         prefs.edit().putBoolean(KEY_BATTERY_PROMPTED, value).apply();
+    }
+
+    void setResumeAt(long epochMillis) {
+        prefs.edit().putLong(KEY_RESUME_AT, epochMillis).apply();
+    }
+
+    void setLibrary(String library) {
+        prefs.edit().putString(KEY_LIBRARY, library).apply();
     }
 }

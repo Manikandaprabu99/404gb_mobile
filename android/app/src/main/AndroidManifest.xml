@@ -55,6 +55,8 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Lets the backup status say "Waiting for Wi-Fi" instead of guessing. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- Reading photos and videos to back them up. Android 14+ users can grant
          only selected items; the app detects that and asks for full access. -->

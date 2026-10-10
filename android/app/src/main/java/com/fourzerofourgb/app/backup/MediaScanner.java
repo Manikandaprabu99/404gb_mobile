@@ -8,6 +8,7 @@ import android.database.Cursor;
 import android.database.sqlite.SQLiteException;
 import android.net.Uri;
 import android.os.Build;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.util.Log;
 import java.util.ArrayList;
@@ -37,7 +38,16 @@ final class MediaScanner {
     private static final long LEGACY_SETTLE_SECONDS = 10;
     private static final Object LOCK = new Object();
 
+    /** elapsedRealtime of the last scan that read both collections, or 0. */
+    private static volatile long lastCompletedAt;
+
     private MediaScanner() {}
+
+    /** True when a scan finished within {@code millis}, so another one would find nothing new. */
+    static boolean scannedWithin(long millis) {
+        long last = lastCompletedAt;
+        return last != 0 && SystemClock.elapsedRealtime() - last < millis;
+    }
 
     /** @return the number of newly queued items, or 0 when media access is missing */
     static int scan(Context context) {
@@ -50,6 +60,7 @@ final class MediaScanner {
             int added = 0;
             added += scanCollection(app, prefs, BackupLedger.COLLECTION_IMAGES);
             added += scanCollection(app, prefs, BackupLedger.COLLECTION_VIDEO);
+            lastCompletedAt = SystemClock.elapsedRealtime();
             return added;
         }
     }
