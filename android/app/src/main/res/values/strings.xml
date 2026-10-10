@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">404GB</string>
+    <string name="title_activity_main">404GB</string>
+    <string name="package_name">com.fourzerofourgb.app</string>
+    <string name="custom_url_scheme">com.fourzerofourgb.app</string>
+</resources>

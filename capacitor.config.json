@@ -1,0 +1,9 @@
+{
+  "appId": "com.fourzerofourgb.app",
+  "appName": "404GB",
+  "webDir": "www",
+  "server": {
+    "url": "https://404gb.vercel.app",
+    "androidScheme": "https"
+  }
+}
