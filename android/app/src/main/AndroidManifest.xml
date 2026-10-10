@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <application
         android:allowBackup="true"
@@ -42,39 +43,37 @@
                 android:resource="@xml/file_paths"></meta-data>
         </provider>
 
-        <!-- 404GB photo-watcher: foreground service that watches MediaStore
-             for new photos/videos and hands them to PhotoWatcherPlugin for
-             upload. dataSync is the closest built-in foregroundServiceType
-             fit for a background upload/backup watcher. -->
+        <!-- Backup uploads run in WorkManager workers; while an upload is in
+             progress the worker promotes itself to this (WorkManager-owned)
+             foreground service, which Android 14+ requires to declare its type. -->
         <service
-            android:name=".photowatcher.PhotoWatcherService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
-
-        <receiver
-            android:name=".photowatcher.PhotoWatcherBootReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-            </intent-filter>
-        </receiver>
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
     </application>
 
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Lets the backup status say "Waiting for Wi-Fi" instead of guessing. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!-- 404GB photo-watcher permissions -->
+    <!-- Reading photos and videos to back them up. Android 14+ users can grant
+         only selected items; the app detects that and asks for full access. -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- Saving originals into Pictures/404GB and Movies/404GB before scoped storage. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+    <!-- Without it Android strips GPS data from the bytes the app reads. -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
+
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <!-- Lets PhotoWatcherPlugin ask the user to exclude the app from
-         battery optimizations, the one documented Android 12+ exemption
-         that lets PhotoWatcherWatchdogWorker's periodic job restart the
-         foreground service from the background reliably. -->
+    <!-- Lets the app ask to be exempt from battery optimization, which also
+         allows the upload worker to show its foreground notification when it
+         starts in the background. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 </manifest>

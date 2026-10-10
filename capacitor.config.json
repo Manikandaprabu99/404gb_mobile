@@ -2,8 +2,17 @@
   "appId": "com.fourzerofourgb.app",
   "appName": "404GB",
   "webDir": "www",
+  "backgroundColor": "#060609",
   "server": {
     "url": "https://404gb.vercel.app",
     "androidScheme": "https"
+  },
+  "android": {
+    "backgroundColor": "#060609"
+  },
+  "plugins": {
+    "SystemBars": {
+      "initialViewportFitValueHint": "cover"
+    }
   }
 }

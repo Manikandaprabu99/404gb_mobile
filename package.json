@@ -1,10 +1,11 @@
 {
   "name": "mobile",
   "version": "1.0.0",
-  "description": "",
+  "description": "404GB Android app (Capacitor wrapper with native background backup)",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "assets": "node scripts/generate-brand-assets.mjs",
+    "sync": "cap sync android"
   },
   "keywords": [],
   "author": "",
@@ -15,5 +16,9 @@
     "@capacitor/browser": "^8.0.5",
     "@capacitor/cli": "^8.5.2",
     "@capacitor/core": "^8.5.2"
-  }
+  },
+  "devDependencies": {
+    "sharp": "^0.35.5"
+  },
+  "private": true
 }
