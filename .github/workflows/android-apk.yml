@@ -31,8 +31,6 @@ jobs:
           java-version: "21"
           cache: gradle
 
-      - uses: android-actions/setup-android@v3
-
       # Each runner would otherwise generate a fresh debug key, and Android refuses
       # to install an APK over one signed with a different key.
       - name: Restore debug signing key
