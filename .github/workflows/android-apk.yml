@@ -2,7 +2,7 @@ name: Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, complete-app]
     paths-ignore:
       - "**/*.md"
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: android-apk
+  group: android-apk-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -48,16 +48,103 @@ jobs:
       - name: Build debug APK
         working-directory: android
         run: |
+          set -o pipefail
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+
+      # Turns compiler/resource/manifest errors into annotations, which are
+      # readable without signing in via the public check-runs API.
+      - name: Report build errors
+        if: failure()
+        env:
+          BUILD_LOG: ${{ runner.temp }}/gradle-build.log
+        run: |
+          [ -f "$BUILD_LOG" ] || exit 0
+          python3 - <<'PY'
+          import os, re
+
+          log_path = os.environ["BUILD_LOG"]
+          root = os.environ.get("GITHUB_WORKSPACE", "") + "/"
+          lines = open(log_path, encoding="utf-8", errors="replace").read().splitlines()
+
+          def esc_data(s):
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          def esc_prop(s):
+              return esc_data(s).replace(":", "%3A").replace(",", "%2C")
+
+          seen, out = set(), []
+
+          def emit(message, file=None, line=None):
+              message = message.strip()
+              if not message or message in seen or len(out) >= 50:
+                  return
+              seen.add(message)
+              props = []
+              if file:
+                  if file.startswith("file://"):
+                      file = file[len("file://"):]
+                  if file.startswith(root):
+                      file = file[len(root):]
+                  props.append("file=" + esc_prop(file))
+                  if line:
+                      props.append("line=" + esc_prop(str(line)))
+              head = "::error " + ",".join(props) + "::" if props else "::error::"
+              out.append(head + esc_data(message))
+
+          javac = re.compile(r"^(/\S+?\.(?:java|kt)):(\d+): error: (.*)$")
+          kotlin = re.compile(r"^e: (?:file://)?(/\S+?\.kt):(\d+):\d+ (.*)$")
+          aapt = re.compile(r"^(?:ERROR: ?)?(/\S+?):(\d+)(?::\d+)?: AAPT: error: (.*)$")
+          manifest = re.compile(r"^(/\S+?AndroidManifest\.xml):(\d+):[\d:-]+ Error:\s*(.*)$")
+          for i, raw in enumerate(lines):
+              text = raw.rstrip()
+              m = javac.match(text)
+              if m:
+                  detail = m.group(3)
+                  # javac prints the offending source line and a caret on the next lines.
+                  if i + 1 < len(lines) and lines[i + 1].strip():
+                      detail += " | " + lines[i + 1].strip()
+                  emit(detail, m.group(1), m.group(2))
+                  continue
+              for pattern in (kotlin, aapt, manifest):
+                  m = pattern.match(text)
+                  if m:
+                      detail = m.group(3)
+                      # The manifest merger prints its message on the following line.
+                      if not detail.strip() and i + 1 < len(lines):
+                          detail = lines[i + 1].strip()
+                      emit(detail, m.group(1), m.group(2))
+                      break
+              else:
+                  if "AAPT: error:" in text or text.startswith("ERROR:") or "Manifest merger failed" in text:
+                      emit(text)
+                  elif re.match(r"^\S.*error: ", text) and "warning:" not in text:
+                      emit(text)
+
+          # Gradle's summary: "FAILURE: ..." followed by "* What went wrong:" and its detail lines.
+          for i, raw in enumerate(lines):
+              if raw.startswith("FAILURE:"):
+                  detail = [raw.strip()]
+                  for nxt in lines[i + 1:i + 40]:
+                      if nxt.startswith("* Try:"):
+                          break
+                      if nxt.strip() and not nxt.startswith("* What went wrong"):
+                          detail.append(nxt.strip())
+                  emit(" ".join(detail)[:1500])
+
+          if not out:
+              emit("Gradle build failed; no compiler errors were recognised in the log (see the job output).")
+          print("\n".join(out))
+          PY
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 404gb-debug-apk
+          name: 404gb-debug-apk-${{ github.ref_name }}
           path: android/app/build/outputs/apk/debug/app-debug.apk
 
       - name: Publish to android-latest release
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

@@ -1,7 +1,7 @@
 package com.fourzerofourgb.app;
 
 import android.os.Bundle;
-import com.fourzerofourgb.app.photowatcher.PhotoWatcherPlugin;
+import com.fourzerofourgb.app.backup.BackupPlugin;
 import com.getcapacitor.BridgeActivity;
 
 public class MainActivity extends BridgeActivity {
@@ -12,7 +12,7 @@ public class MainActivity extends BridgeActivity {
         // BridgeActivity actually builds the Bridge from the accumulated
         // plugin list (this class's Bridge.Builder field is already
         // constructed by the time this method runs).
-        registerPlugin(PhotoWatcherPlugin.class);
+        registerPlugin(BackupPlugin.class);
         super.onCreate(savedInstanceState);
     }
 }

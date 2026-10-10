@@ -4,4 +4,14 @@
     <string name="title_activity_main">404GB</string>
     <string name="package_name">com.fourzerofourgb.app</string>
     <string name="custom_url_scheme">com.fourzerofourgb.app</string>
+
+    <string name="backup_channel_progress">Backup progress</string>
+    <string name="backup_channel_progress_description">Shown while 404GB uploads photos and videos to your library</string>
+    <string name="backup_channel_attention">Backup alerts</string>
+    <string name="backup_channel_attention_description">Tells you when backup needs your attention</string>
+    <string name="backup_progress_preparing">Preparing backup</string>
+    <string name="backup_progress_title">Backing up %1$d of %2$d</string>
+    <string name="backup_sign_in_title">Sign in to keep backing up</string>
+    <string name="backup_sign_in_text">Open 404GB and sign in again so new photos and videos keep backing up.</string>
+    <string name="share_chooser_title">Share</string>
 </resources>
