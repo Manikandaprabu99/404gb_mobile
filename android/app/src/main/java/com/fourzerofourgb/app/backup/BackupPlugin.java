@@ -14,6 +14,7 @@ import android.util.Log;
 import androidx.core.content.FileProvider;
 import androidx.work.ExistingWorkPolicy;
 import com.fourzerofourgb.app.R;
+import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -27,6 +28,8 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.regex.Pattern;
+import org.json.JSONObject;
 
 /**
  * JS bridge for native backup (web: lib/native/backup.ts). Backup itself runs
@@ -56,6 +59,11 @@ public class BackupPlugin extends Plugin {
     private static final String TAG = "404gb.BackupPlugin";
     private static final String EVENT_STATUS = "statusChanged";
     private static final String EVENT_SAVE_PROGRESS = "saveProgress";
+    private static final String EVENT_ITEMS_UPLOADED = "itemsUploaded";
+    // Printable ASCII, no spaces: classic, fine-grained and OAuth tokens all fit, header injection can't.
+    private static final Pattern TOKEN = Pattern.compile("^[\\x21-\\x7E]{1,1024}$");
+    private static final Pattern REPO_NAME = Pattern.compile("^[A-Za-z0-9_.-]{1,100}$");
+    private static final Pattern BRANCH_CHARS = Pattern.compile("^[A-Za-z0-9._/+@-]{1,255}$");
 
     // Lets workers reach the plugin of the live bridge (if any) to emit events.
     private static volatile WeakReference<BackupPlugin> live = new WeakReference<>(null);
@@ -116,6 +124,13 @@ public class BackupPlugin extends Plugin {
     /** Called from {@link BackupStatus} (any thread). */
     void emitStatusChanged(JSObject status) {
         getBridge().execute(() -> notifyListeners(EVENT_STATUS, status));
+    }
+
+    /** Called from the upload worker after a commit: {entries: MediaIndexEntry[]}, newest last. */
+    void emitItemsUploaded(JSArray entries) {
+        JSObject data = new JSObject();
+        data.put("entries", entries);
+        getBridge().execute(() -> notifyListeners(EVENT_ITEMS_UPLOADED, data));
     }
 
     @PluginMethod
@@ -270,25 +285,106 @@ public class BackupPlugin extends Plugin {
     }
 
     /**
-     * Tells backup which library ("owner/repo") the app is signed in to. When it
-     * differs from the one the phone has been uploading to, everything is
-     * queued again for the new repo.
+     * Stores the GitHub session the worker uploads with (web: docs/STANDALONE.md).
+     * A different owner/repo than the one the phone was backing up into queues
+     * everything again for the new repo. Starts (or restarts) backup when enabled.
      */
     @PluginMethod
-    public void setLibrary(PluginCall call) {
-        String library = call.getString("repo");
-        if (library == null || !library.trim().matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")) {
-            call.reject("repo must look like \"owner/name\"", "INVALID_ARGUMENT");
+    public void setAuth(PluginCall call) {
+        String token = call.getString("token");
+        String login = call.getString("login", "");
+        String owner = trimmed(call.getString("owner", ""));
+        String repo = trimmed(call.getString("repo", ""));
+        String branch = trimmed(call.getString("branch", ""));
+        if (token == null || !TOKEN.matcher(token).matches()) {
+            call.reject("token must be a GitHub token", "INVALID_ARGUMENT");
             return;
         }
+        if (owner.isEmpty() != repo.isEmpty() || (!owner.isEmpty() && (!isRepoName(owner) || !isRepoName(repo)))) {
+            call.reject("owner and repo must both be GitHub names (or both empty)", "INVALID_ARGUMENT");
+            return;
+        }
+        if (!branch.isEmpty() && !isBranchName(branch)) {
+            call.reject("branch is not a valid branch name", "INVALID_ARGUMENT");
+            return;
+        }
+        BackupPrefs.Auth auth = new BackupPrefs.Auth(
+            token,
+            login == null ? "" : trimmed(login),
+            owner,
+            repo,
+            owner.isEmpty() ? "" : branch
+        );
         Context context = getContext();
         runInBackground(call, () -> {
             BackupPrefs prefs = BackupPrefs.get(context);
-            boolean changed = BackupLedger.get(context).adoptLibrary(prefs, library.trim());
-            if (changed && prefs.isEnabled()) {
-                BackupScheduler.kickUpload(context);
-                scanSoon();
+            BackupPrefs.Auth previous = prefs.auth();
+            boolean libraryChanged;
+            // Together, so a worker starting in between never sees the new library with the old session.
+            synchronized (BackupLedger.class) {
+                libraryChanged = auth.hasLibrary() && BackupLedger.get(context).adoptLibrary(prefs, auth.library());
+                prefs.setAuth(auth);
             }
+            boolean sessionChanged = previous == null || !previous.token.equals(auth.token) || !previous.sameTarget(auth);
+            boolean wasBlocked = prefs.needsSignIn();
+            prefs.setNeedsSignIn(false);
+            prefs.setSignInNotified(false);
+            BackupNotifications.clearSignInNeeded(context);
+            if (prefs.isEnabled() && auth.hasLibrary()) {
+                if (sessionChanged) {
+                    // A run still using the old token or repo is replaced (it stops at its next request).
+                    BackupScheduler.restartUpload(context);
+                } else if (wasBlocked) {
+                    BackupScheduler.kickUpload(context);
+                } else {
+                    BackupScheduler.enqueueUpload(context, ExistingWorkPolicy.KEEP, 0);
+                }
+                if (libraryChanged) {
+                    scanSoon();
+                }
+            }
+            call.resolve(BackupStatus.build(context));
+            BackupStatus.changed(context);
+        });
+    }
+
+    /** The stored session, or {auth: null} when signed out. */
+    @PluginMethod
+    public void getAuth(PluginCall call) {
+        BackupPrefs.Auth auth = BackupPrefs.get(getContext()).auth();
+        JSObject result = new JSObject();
+        if (auth == null) {
+            result.put("auth", JSONObject.NULL);
+        } else {
+            JSObject session = new JSObject();
+            session.put("token", auth.token);
+            session.put("login", auth.login);
+            session.put("owner", auth.owner);
+            session.put("repo", auth.repo);
+            session.put("branch", auth.branch);
+            result.put("auth", session);
+        }
+        call.resolve(result);
+    }
+
+    /**
+     * Forgets the token on this phone (a Device Flow token can't be revoked
+     * without the client secret). Backup pauses as needs_sign_in; the ledger,
+     * login and repo are kept so signing in again carries on where it was.
+     */
+    @PluginMethod
+    public void clearAuth(PluginCall call) {
+        Context context = getContext();
+        runInBackground(call, () -> {
+            BackupPrefs prefs = BackupPrefs.get(context);
+            prefs.clearToken();
+            prefs.setNeedsSignIn(false);
+            // Signing out on purpose isn't something to be reminded about.
+            prefs.setSignInNotified(true);
+            BackupNotifications.clearSignInNeeded(context);
+            // Stop using the forgotten token right away; setAuth schedules uploads again.
+            BackupScheduler.cancelUpload(context);
+            LibraryIndex.clear(context);
             call.resolve(BackupStatus.build(context));
             BackupStatus.changed(context);
         });
@@ -338,7 +434,7 @@ public class BackupPlugin extends Plugin {
                 JSObject result = new JSObject();
                 result.put("uri", uri.toString());
                 call.resolve(result);
-            } catch (ApiClient.AuthRequiredException e) {
+            } catch (GitHubClient.AuthRequiredException | GitHubClient.AuthChangedException e) {
                 call.reject("Sign in again to download this item", "NEEDS_SIGN_IN", e);
             } catch (Exception e) {
                 call.reject("Could not save to device: " + e.getMessage(), "SAVE_FAILED", e);
@@ -374,7 +470,7 @@ public class BackupPlugin extends Plugin {
                             call.reject("No app can share this item", "SHARE_FAILED");
                         }
                     });
-            } catch (ApiClient.AuthRequiredException e) {
+            } catch (GitHubClient.AuthRequiredException | GitHubClient.AuthChangedException e) {
                 call.reject("Sign in again to share this item", "NEEDS_SIGN_IN", e);
             } catch (Exception e) {
                 call.reject("Could not share: " + e.getMessage(), "SHARE_FAILED", e);
@@ -466,5 +562,24 @@ public class BackupPlugin extends Plugin {
     private static boolean bool(PluginCall call, String key, boolean fallback) {
         Boolean value = call.getBoolean(key, fallback);
         return value != null ? value : fallback;
+    }
+
+    private static String trimmed(String value) {
+        return value == null ? "" : value.trim();
+    }
+
+    private static boolean isRepoName(String name) {
+        return REPO_NAME.matcher(name).matches() && !".".equals(name) && !"..".equals(name);
+    }
+
+    /** Git's ref-name rules, limited to characters that are safe in API paths. */
+    private static boolean isBranchName(String branch) {
+        if (!BRANCH_CHARS.matcher(branch).matches()) {
+            return false;
+        }
+        if (branch.startsWith("/") || branch.endsWith("/") || branch.endsWith(".") || branch.endsWith(".lock")) {
+            return false;
+        }
+        return !branch.contains("..") && !branch.contains("//") && !branch.contains("/.") && !branch.startsWith(".");
     }
 }

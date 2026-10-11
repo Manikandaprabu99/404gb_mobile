@@ -2,6 +2,7 @@ package com.fourzerofourgb.app.backup;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
@@ -18,11 +19,12 @@ import org.json.JSONObject;
 
 final class BackupUtil {
 
-    /** Every transfer is one chunk so it fits under Vercel's 4.5 MB body cap. */
+    /** The repo format's chunk size: objects/ files are at most 4 MiB. */
     static final int CHUNK_SIZE = 4 * 1024 * 1024;
 
     private static final char[] HEX = "0123456789abcdef".toCharArray();
     private static final Pattern HEX_SHA256 = Pattern.compile("^[0-9a-f]{64}$");
+    private static final Pattern MEDIA_ID = Pattern.compile("^media_[A-Za-z0-9_-]{1,80}$");
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private BackupUtil() {}
@@ -53,6 +55,33 @@ final class BackupUtil {
 
     static boolean isSha256Hex(String value) {
         return value != null && HEX_SHA256.matcher(value).matches();
+    }
+
+    /** lib/media/types.ts isMediaId. */
+    static boolean isMediaId(String value) {
+        return value != null && MEDIA_ID.matcher(value).matches();
+    }
+
+    /** The sha git (and so GitHub's blob API) gives this content: SHA-1 of "blob <size>\0" + bytes. */
+    static String gitBlobSha(byte[] data) {
+        MessageDigest sha1;
+        try {
+            sha1 = MessageDigest.getInstance("SHA-1");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-1 is not available", e);
+        }
+        sha1.update(("blob " + data.length + "\0").getBytes(StandardCharsets.US_ASCII));
+        sha1.update(data);
+        return hex(sha1.digest());
+    }
+
+    /** String value of {@code key}, or null when the object is null or the value is absent, JSON null or empty. */
+    static String optString(JSONObject json, String key) {
+        if (json == null || json.isNull(key)) {
+            return null;
+        }
+        String value = json.optString(key, "");
+        return value.isEmpty() ? null : value;
     }
 
     /** Repo path of a content-addressed chunk, as the web app stores it. */

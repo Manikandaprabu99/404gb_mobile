@@ -2,7 +2,7 @@ name: Android APK
 
 on:
   push:
-    branches: [main, complete-app]
+    branches: [main, complete-app, standalone]
     paths-ignore:
       - "**/*.md"
   workflow_dispatch:
@@ -17,13 +17,48 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      WEB_REPO: Manikandaprabu99/404GB_sourcecode
     steps:
       - uses: actions/checkout@v4
+
+      # The app's UI is the web project's static export, bundled into the APK. Build it from the
+      # web branch named like this branch when there is one, else from main.
+      - name: Pick the web app branch
+        id: web
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set +e
+          git ls-remote --exit-code --heads "https://github.com/$WEB_REPO.git" "refs/heads/$BRANCH" > /dev/null
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            ref="$BRANCH"
+          elif [ "$code" -eq 2 ]; then
+            ref=main
+          else
+            echo "::error::Could not list the branches of $WEB_REPO (git ls-remote exit code $code)"
+            exit 1
+          fi
+          echo "Building the UI from $WEB_REPO@$ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the web app
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WEB_REPO }}
+          ref: ${{ steps.web.outputs.ref }}
+          path: web-src
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web-src/package-lock.json
 
       - uses: actions/setup-java@v4
         with:
@@ -42,6 +77,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # NEXT_PUBLIC_GITHUB_CLIENT_ID is inlined at build time; empty hides the Device Flow sign-in.
+      - name: Build the web app
+        working-directory: web-src
+        run: |
+          set -o pipefail
+          export NEXT_PUBLIC_GITHUB_CLIENT_ID="$(tr -d '[:space:]' < ../config/github-client-id)"
+          echo "GitHub OAuth client id: ${NEXT_PUBLIC_GITHUB_CLIENT_ID:-(none, token sign-in only)}"
+          npm ci 2>&1 | tee "$RUNNER_TEMP/web-build.log"
+          npm run build 2>&1 | tee -a "$RUNNER_TEMP/web-build.log"
+          test -f out/index.html || { echo "::error::The web build produced no out/index.html (is output: \"export\" set?)"; exit 1; }
+
+      - name: Bundle the web app as www/
+        run: |
+          rm -rf www
+          cp -R web-src/out www
+
       - name: Sync Capacitor project
         run: npx cap sync android
 
@@ -51,6 +102,22 @@ jobs:
           set -o pipefail
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 404gb-debug-apk-${{ github.ref_name }}
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      # JVM unit tests (JsJson must write manifests byte-for-byte like the web app's JavaScript).
+      # Report-only: failures become annotations but never hold back the APK or its release.
+      - name: Run unit tests
+        id: unit_tests
+        continue-on-error: true
+        working-directory: android
+        run: |
+          set -o pipefail
+          ./gradlew testDebugUnitTest --no-daemon 2>&1 | tee -a "$RUNNER_TEMP/gradle-build.log"
 
       # Turns compiler/resource/manifest errors into annotations, which are
       # readable without signing in via the public check-runs API.
@@ -137,11 +204,50 @@ jobs:
           print("\n".join(out))
           PY
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: 404gb-debug-apk-${{ github.ref_name }}
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Report unit test failures
+        if: steps.unit_tests.outcome == 'failure'
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+
+          def esc(s):
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          out = []
+          for path in glob.glob("android/app/build/test-results/testDebugUnitTest/*.xml"):
+              for case in ET.parse(path).getroot().iter("testcase"):
+                  for problem in list(case.findall("failure")) + list(case.findall("error")):
+                      cls = case.get("classname", "")
+                      source = "android/app/src/test/java/" + cls.replace(".", "/") + ".java"
+                      message = (problem.get("message") or problem.text or "failed").strip()[:1500]
+                      out.append("::error file=%s::%s.%s: %s" % (source, cls.split(".")[-1], case.get("name"), esc(message)))
+          print("\n".join(out[:50]))
+          PY
+
+      - name: Report web build errors
+        if: failure()
+        env:
+          WEB_LOG: ${{ runner.temp }}/web-build.log
+          BUILD_LOG: ${{ runner.temp }}/gradle-build.log
+        run: |
+          # Only when the web build is what failed (Gradle never ran).
+          [ -f "$WEB_LOG" ] && [ ! -f "$BUILD_LOG" ] || exit 0
+          python3 - <<'PY'
+          import os, re
+
+          def esc(s):
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          lines = open(os.environ["WEB_LOG"], encoding="utf-8", errors="replace").read().splitlines()
+          hits = [l.strip() for l in lines if re.search(r"(Type error|Failed to compile|Error:|error TS\d+|ERR!|Module not found)", l)]
+          if not hits:
+              hits = [" | ".join(l.strip() for l in lines[-20:] if l.strip())]
+          seen = []
+          for hit in hits:
+              if hit and hit not in seen and len(seen) < 30:
+                  seen.append(hit)
+                  print("::error title=Web app build::" + esc(hit[:1500]))
+          PY
 
       - name: Publish to android-latest release
         if: github.ref == 'refs/heads/main'

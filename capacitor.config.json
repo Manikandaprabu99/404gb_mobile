@@ -4,7 +4,6 @@
   "webDir": "www",
   "backgroundColor": "#060609",
   "server": {
-    "url": "https://404gb.vercel.app",
     "androidScheme": "https"
   },
   "android": {

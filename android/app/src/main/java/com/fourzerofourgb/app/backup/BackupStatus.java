@@ -204,7 +204,8 @@ final class BackupStatus {
         if (!MediaAccess.hasFullAccess(context)) {
             return STATE_NEEDS_PERMISSION;
         }
-        if (prefs.needsSignIn()) {
+        // No token (or no repo chosen yet), or GitHub refused the stored token.
+        if (!prefs.canUpload() || prefs.needsSignIn()) {
             return STATE_NEEDS_SIGN_IN;
         }
         if (rateLimited) {

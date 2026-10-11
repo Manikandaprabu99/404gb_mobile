@@ -7,7 +7,6 @@ import android.os.Build;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.webkit.MimeTypeMap;
-import com.getcapacitor.JSObject;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -15,31 +14,59 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.regex.Pattern;
-import org.json.JSONArray;
-import org.json.JSONObject;
 
 /**
- * Uploads one ledger item: hash pass, init (dedup + missing chunks), chunk
- * uploads with every blob sha persisted as it arrives, native thumbnails,
- * then the commit. Files are streamed with a single 4 MiB buffer and never
- * loaded whole.
+ * Gets one ledger item ready for the next commit: hash pass, duplicate checks
+ * (this phone's ledger, then the library's index at the branch head), chunk
+ * uploads straight to GitHub with every blob sha persisted as it arrives,
+ * native thumbnails, and the normalized record. Files are streamed with a
+ * single 4 MiB buffer and never loaded whole.
  */
 final class MediaUploader {
 
     enum Outcome {
+        /** Its bytes were already committed by this phone (an earlier answer was lost). */
         UPLOADED,
         DUPLICATE,
         FAILED,
+        /** The blobs are on GitHub; the next commit adds it (see {@link Prepared#op}). */
+        READY,
+        /** In the library without a capture date; the next commit gives it this file's date. */
+        NEEDS_DATE,
     }
 
     interface Progress {
         void onProgress(String name, long bytesDone, long bytesTotal);
+    }
+
+    /** The worker's batch of prepared items that aren't committed yet. */
+    interface Batch {
+        /** True when a waiting new item has this whole-file hash ("sha256:&lt;hex&gt;"). */
+        boolean hasFile(String fileHash);
+
+        /** Commits the waiting items now. */
+        void commitNow() throws IOException;
+    }
+
+    static final class Prepared {
+
+        final Outcome outcome;
+        /** What the next commit must do, for READY and NEEDS_DATE; null otherwise. */
+        final LibraryWriter.Op op;
+
+        Prepared(Outcome outcome, LibraryWriter.Op op) {
+            this.outcome = outcome;
+            this.op = op;
+        }
     }
 
     /** A local problem with the file itself (not the network). */
@@ -73,23 +100,27 @@ final class MediaUploader {
 
     private static final String TAG = "404gb.MediaUploader";
     private static final Pattern MEDIA_MIME = Pattern.compile("^(?:image|video)/[a-z0-9.+-]+$");
-    private static final Pattern MEDIA_ID = Pattern.compile("^media_[A-Za-z0-9_-]{1,80}$");
-    private static final int MAX_COMMIT_ROUNDS = 3;
+    private static final String FILE_HASH_PREFIX = "sha256:";
+    /** Ledger key prefix for a saved thumbnail blob sha ("thumb:320"); chunk shas are keyed by chunk hash. */
+    private static final String THUMB_KEY = "thumb:";
+    private static final int[] THUMB_SIZES = { 320, 800, 1600 };
 
     private final Context context;
     private final ContentResolver resolver;
     private final BackupLedger ledger;
     private final BackupPrefs prefs;
-    private final ApiClient api;
-    private final ApiClient.StopSignal stop;
+    private final GitHubClient github;
+    private final LibraryWriter library;
+    private final GitHubClient.StopSignal stop;
     private final byte[] buffer = new byte[BackupUtil.CHUNK_SIZE];
 
-    MediaUploader(Context context, BackupLedger ledger, ApiClient api, ApiClient.StopSignal stop) {
+    MediaUploader(Context context, BackupLedger ledger, GitHubClient github, LibraryWriter library, GitHubClient.StopSignal stop) {
         this.context = context.getApplicationContext();
         this.resolver = this.context.getContentResolver();
         this.ledger = ledger;
         this.prefs = BackupPrefs.get(this.context);
-        this.api = api;
+        this.github = github;
+        this.library = library;
         this.stop = stop;
     }
 
@@ -99,7 +130,7 @@ final class MediaUploader {
      * so the worker can stop and resume later; the item keeps its saved
      * progress and goes back to pending.
      */
-    Outcome upload(BackupLedger.Item item, Progress progress) throws IOException {
+    Prepared prepare(BackupLedger.Item item, Progress progress, Batch batch) throws IOException {
         ledger.markUploading(item);
         Uri uri = Uri.parse(item.uri);
         String name = displayName(item);
@@ -113,118 +144,84 @@ final class MediaUploader {
             String alreadyBackedUp = ledger.findBackedUpMediaId(hashed.fileHash, item);
             if (alreadyBackedUp != null) {
                 ledger.markDuplicate(item, alreadyBackedUp, hashed.fileHash);
-                return Outcome.DUPLICATE;
+                return new Prepared(Outcome.DUPLICATE, null);
             }
 
             // Saved blob shas and the id are only valid for the exact same bytes.
             boolean sameContent = hashed.fileHash.equals(item.fileHash);
-            Map<String, String> shas = sameContent ? BackupUtil.parseStringMap(item.chunkShasJson) : new HashMap<>();
-            shas.keySet().retainAll(new HashSet<>(hashed.chunkHashes));
-            String mediaId = sameContent && item.mediaId != null ? item.mediaId : BackupUtil.newMediaId();
-            ledger.saveIdentity(item, hashed.fileHash, mediaId, shas);
+            Map<String, String> saved = sameContent ? BackupUtil.parseStringMap(item.chunkShasJson) : new HashMap<String, String>();
+            keepUsable(saved, hashed);
+            String mediaId = sameContent && BackupUtil.isMediaId(item.mediaId) ? item.mediaId : BackupUtil.newMediaId();
+            ledger.saveIdentity(item, hashed.fileHash, mediaId, saved);
 
-            JSObject initBody = new JSObject();
-            initBody.put("chunkHashes", new JSONArray(hashed.chunkHashes));
-            initBody.put("fileHash", hashed.fileHash);
-            JSONObject init = api.postJson("/api/media/upload/init", initBody);
-            // Backstop for a repo switch the web app didn't report via setLibrary.
-            String library = ApiClient.optString(init, "library");
-            if (library != null && ledger.adoptLibrary(prefs, library)) {
-                BackupStatus.changed(context);
+            String fileHash = FILE_HASH_PREFIX + hashed.fileHash;
+            if (batch.hasFile(fileHash)) {
+                // A copy of these bytes waits in the uncommitted batch: commit it, then this one is a duplicate.
+                batch.commitNow();
             }
-            String duplicateOf = ApiClient.optString(init, "duplicateOf");
-            if (duplicateOf != null) {
-                Outcome outcome = finishExisting(item, duplicateOf, mediaId, hashed.fileHash);
-                if (init.optBoolean("duplicateNeedsDate", false)) {
-                    fillMissingDate(duplicateOf, item);
-                }
-                return outcome;
+            LibraryIndex index = library.headIndex();
+            int existing = index.indexOfHash(fileHash);
+            if (existing >= 0) {
+                return finishExisting(item, index.idAt(existing), index.isDated(existing), mediaId, hashed.fileHash);
             }
-            Set<String> toUpload = knownHashes(init.optJSONArray("missing"), hashed);
-            toUpload.removeAll(shas.keySet());
-            uploadChunks(item, source, hashed, toUpload, shas, name, progress);
 
-            Map<String, String> thumbnailShas = uploadThumbnails(item, uri);
-
-            for (int round = 1; ; round++) {
-                JSObject body = new JSObject();
-                body.put("record", buildRecord(item, uri, name, mime, hashed, mediaId, thumbnailShas));
-                body.put("chunkBlobShas", toJsObject(shas));
-                if (!thumbnailShas.isEmpty()) {
-                    body.put("thumbnailBlobShas", toJsObject(thumbnailShas));
-                }
-                JSONObject result;
-                try {
-                    result = api.postJson("/api/media/upload/commit", body);
-                } catch (ApiClient.HttpStatusException e) {
-                    if (round >= MAX_COMMIT_ROUNDS) {
-                        throw e;
-                    }
-                    Set<String> again = chunksToResend(e, hashed, shas);
-                    if (again.isEmpty()) {
-                        throw e;
-                    }
-                    shas.keySet().removeAll(again);
-                    ledger.saveChunkShas(item, shas);
-                    uploadChunks(item, source, hashed, again, shas, name, progress);
-                    continue;
-                }
-                // The server may assign a different id (e.g. on an id clash); its answer is authoritative.
-                String id = ApiClient.optString(result, "id");
-                if (id == null) {
-                    id = mediaId;
-                }
-                if (result.optBoolean("duplicate", false) && !id.equals(mediaId)) {
-                    ledger.markDuplicate(item, id, hashed.fileHash);
-                    return Outcome.DUPLICATE;
-                }
-                ledger.markDone(item, id, hashed.fileHash);
-                prefs.setLastBackupAt(System.currentTimeMillis());
-                return Outcome.UPLOADED;
+            uploadChunks(item, source, hashed, saved, name, progress);
+            SortedMap<Integer, String> thumbnails = uploadThumbnails(item, uri, saved);
+            Map<String, String> chunkBlobShas = new LinkedHashMap<>();
+            for (String hash : hashed.chunkHashes) {
+                chunkBlobShas.put(hash, saved.get(hash));
             }
+            LibraryWriter.Draft draft = draft(item, uri, name, mime, hashed);
+            return new Prepared(Outcome.READY, new LibraryWriter.NewItem(item, draft, mediaId, chunkBlobShas, thumbnails));
         } catch (MediaReadException e) {
             // A vanished file also lands here; the next scan drops its row once MediaStore forgets it.
             ledger.recordFailure(item, e.getMessage(), e.changed);
-            return Outcome.FAILED;
-        } catch (ApiClient.HttpStatusException e) {
-            ledger.recordFailure(item, e.getMessage(), "unknown_blob".equals(e.code));
+            return new Prepared(Outcome.FAILED, null);
+        } catch (GitHubClient.HttpStatusException e) {
+            ledger.recordFailure(item, e.getMessage(), false);
             if (e.isServerError()) {
                 throw e;
             }
-            return Outcome.FAILED;
+            return new Prepared(Outcome.FAILED, null);
         } catch (SecurityException e) {
             ledger.recordFailure(item, "No permission to read this file", false);
-            return Outcome.FAILED;
+            return new Prepared(Outcome.FAILED, null);
         }
     }
 
-    private Outcome finishExisting(BackupLedger.Item item, String existingId, String mediaId, String fileHash) {
-        // Our own earlier commit whose response was lost still counts as uploaded by this phone.
-        if (existingId.equals(mediaId)) {
+    /** Records a commit's outcomes in the ledger. */
+    void finish(LibraryWriter.Result result) {
+        boolean uploaded = false;
+        for (LibraryWriter.Outcome outcome : result.outcomes) {
+            BackupLedger.Item item = (BackupLedger.Item) outcome.op.tag;
+            String fileHash = outcome.op.fileHash.substring(FILE_HASH_PREFIX.length());
+            if (outcome.kind == LibraryWriter.Kind.ADDED || outcome.kind == LibraryWriter.Kind.OWN) {
+                ledger.markDone(item, outcome.mediaId, fileHash);
+                uploaded = true;
+            } else {
+                ledger.markDuplicate(item, outcome.mediaId, fileHash);
+            }
+        }
+        if (uploaded) {
+            prefs.setLastBackupAt(System.currentTimeMillis());
+        }
+    }
+
+    private Prepared finishExisting(BackupLedger.Item item, String existingId, boolean dated, String mediaId, String fileHash) {
+        // Our own earlier commit whose answer was lost still counts as uploaded by this phone.
+        if (mediaId.equals(existingId)) {
             ledger.markDone(item, existingId, fileHash);
             prefs.setLastBackupAt(System.currentTimeMillis());
-            return Outcome.UPLOADED;
+            return new Prepared(Outcome.UPLOADED, null);
+        }
+        // Best effort: the library copy (an older web upload) has no capture date, so it
+        // sorts under its upload day; the next commit gives it this file's date.
+        String takenAt = takenAt(item);
+        if (!dated && takenAt != null && BackupUtil.isMediaId(existingId)) {
+            return new Prepared(Outcome.NEEDS_DATE, new LibraryWriter.DateFix(item, FILE_HASH_PREFIX + fileHash, existingId, takenAt));
         }
         ledger.markDuplicate(item, existingId, fileHash);
-        return Outcome.DUPLICATE;
-    }
-
-    /**
-     * Best effort: the library copy (an older web upload) has no capture date, so
-     * it sorts under its upload day; give it this file's date. Never overwrites.
-     */
-    private void fillMissingDate(String mediaId, BackupLedger.Item item) throws IOException {
-        long taken = takenMillis(item);
-        if (taken <= 0 || !MEDIA_ID.matcher(mediaId).matches()) {
-            return;
-        }
-        JSObject body = new JSObject();
-        body.put("takenAt", BackupUtil.isoUtc(taken));
-        try {
-            api.postJson("/api/media/" + mediaId + "/taken-at", body);
-        } catch (ApiClient.HttpStatusException e) {
-            Log.w(TAG, "Could not set the capture date of " + mediaId, e);
-        }
+        return new Prepared(Outcome.DUPLICATE, null);
     }
 
     /** MediaStore DATE_TAKEN (ms), else DATE_MODIFIED (s); 0 when neither is known. */
@@ -232,32 +229,31 @@ final class MediaUploader {
         return item.dateTaken > 0 ? item.dateTaken : item.dateModified * 1000L;
     }
 
-    /** Chunks a failed commit says must be uploaded again; empty when the error isn't recoverable that way. */
-    private static Set<String> chunksToResend(ApiClient.HttpStatusException e, HashResult hashed, Map<String, String> shas) {
-        if (e.status == 409 && "missing_chunks".equals(e.code)) {
-            return knownHashes(e.body == null ? null : e.body.optJSONArray("missing"), hashed);
-        }
-        if (e.status == 422 && "unknown_blob".equals(e.code)) {
-            // GitHub no longer knows the blob shas we sent: upload all of them again.
-            return new HashSet<>(shas.keySet());
-        }
-        return new HashSet<>();
+    /** The capture date as the record stores it, or null when unknown or implausible. */
+    private static String takenAt(BackupLedger.Item item) {
+        long taken = takenMillis(item);
+        return taken > 0 ? LibraryWriter.normalizeDate(taken) : null;
     }
 
-    /** The subset of {@code array} that are chunk hashes of this file. */
-    private static Set<String> knownHashes(JSONArray array, HashResult hashed) {
-        Set<String> ours = new HashSet<>(hashed.chunkHashes);
-        Set<String> out = new HashSet<>();
-        if (array == null) {
-            return out;
-        }
-        for (int i = 0; i < array.length(); i++) {
-            String hash = array.optString(i, "").toLowerCase(Locale.US);
-            if (ours.contains(hash)) {
-                out.add(hash);
+    /** Drops saved shas that don't belong to these bytes: keeps this file's chunk hashes and "thumb:" keys. */
+    private static void keepUsable(Map<String, String> saved, HashResult hashed) {
+        Set<String> chunks = new HashSet<>(hashed.chunkHashes);
+        Iterator<Map.Entry<String, String>> entries = saved.entrySet().iterator();
+        while (entries.hasNext()) {
+            String key = entries.next().getKey();
+            if (!chunks.contains(key) && !isThumbKey(key)) {
+                entries.remove();
             }
         }
-        return out;
+    }
+
+    private static boolean isThumbKey(String key) {
+        for (int size : THUMB_SIZES) {
+            if (key.equals(THUMB_KEY + size)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Uri chooseSource(Uri uri) {
@@ -305,22 +301,18 @@ final class MediaUploader {
         return new HashResult(chunkHashes, BackupUtil.hex(whole.digest()), size);
     }
 
-    /** Pass 2: re-reads the file and uploads the chunks in {@code needed}, one at a time. */
-    private void uploadChunks(
-        BackupLedger.Item item,
-        Uri source,
-        HashResult hashed,
-        Set<String> needed,
-        Map<String, String> shas,
-        String name,
-        Progress progress
-    ) throws IOException, MediaReadException {
+    /** Pass 2: re-reads the file and uploads every chunk without a saved blob sha, one at a time. */
+    private void uploadChunks(BackupLedger.Item item, Uri source, HashResult hashed, Map<String, String> saved, String name, Progress progress)
+        throws IOException, MediaReadException {
         Map<String, Integer> occurrences = new HashMap<>();
+        Set<String> remaining = new HashSet<>();
         for (String hash : hashed.chunkHashes) {
             Integer count = occurrences.get(hash);
             occurrences.put(hash, count == null ? 1 : count + 1);
+            if (!saved.containsKey(hash)) {
+                remaining.add(hash);
+            }
         }
-        Set<String> remaining = new HashSet<>(needed);
         long done = hashed.size;
         for (int i = 0; i < hashed.chunkHashes.size(); i++) {
             if (remaining.contains(hashed.chunkHashes.get(i))) {
@@ -348,9 +340,9 @@ final class MediaUploader {
                 if (!BackupUtil.sha256Hex(buffer, 0, length).equals(expected)) {
                     throw new MediaReadException("The file changed while uploading", true, null);
                 }
-                String sha = api.uploadChunk(buffer, length, expected);
-                shas.put(expected, sha);
-                ledger.saveChunkShas(item, shas);
+                String sha = github.createBlob(buffer, 0, length);
+                saved.put(expected, sha);
+                ledger.saveChunkShas(item, saved);
                 remaining.remove(expected);
                 Integer count = occurrences.get(expected);
                 done += (long) length * (count == null ? 1 : count);
@@ -361,42 +353,50 @@ final class MediaUploader {
         }
     }
 
-    /** Best effort: returns blob shas of the thumbnails that made it, keyed by size. */
-    private Map<String, String> uploadThumbnails(BackupLedger.Item item, Uri uri) throws IOException {
-        Map<String, String> shas = new LinkedHashMap<>();
+    /**
+     * Best effort: blob shas of the thumbnails that made it, by size. A webp an
+     * earlier attempt uploaded already (same git blob sha), or identical to
+     * another size's, isn't sent again.
+     */
+    private SortedMap<Integer, String> uploadThumbnails(BackupLedger.Item item, Uri uri, Map<String, String> saved) throws IOException {
+        SortedMap<Integer, String> shas = new TreeMap<>();
         List<Thumbnails.Thumb> thumbs = Thumbnails.generate(context, uri, item.isVideo(), item.orientation);
-        for (Thumbnails.Thumb thumb : thumbs) {
-            try {
-                String hash = BackupUtil.sha256Hex(thumb.webp, 0, thumb.webp.length);
-                shas.put(thumb.size, api.uploadChunk(thumb.webp, thumb.webp.length, hash));
-            } catch (ApiClient.HttpStatusException e) {
-                Log.w(TAG, "Thumbnail upload failed; committing without the rest", e);
-                break;
+        if (thumbs.isEmpty()) {
+            // Not decodable this time: thumbnails an earlier attempt uploaded are still good.
+            for (int size : THUMB_SIZES) {
+                String sha = saved.get(THUMB_KEY + size);
+                if (sha != null) {
+                    shas.put(size, sha);
+                }
             }
+            return shas;
+        }
+        Map<String, String> sent = new HashMap<>();
+        for (Thumbnails.Thumb thumb : thumbs) {
+            int size = Integer.parseInt(thumb.size);
+            String gitSha = BackupUtil.gitBlobSha(thumb.webp);
+            String sha = sent.get(gitSha);
+            if (sha == null && gitSha.equals(saved.get(THUMB_KEY + size))) {
+                sha = gitSha;
+            }
+            if (sha == null) {
+                try {
+                    sha = github.createBlob(thumb.webp, 0, thumb.webp.length);
+                } catch (GitHubClient.HttpStatusException e) {
+                    Log.w(TAG, "Thumbnail upload failed; committing without the rest", e);
+                    break;
+                }
+                saved.put(THUMB_KEY + size, sha);
+                ledger.saveChunkShas(item, saved);
+            }
+            sent.put(gitSha, sha);
+            shas.put(size, sha);
         }
         return shas;
     }
 
-    private JSObject buildRecord(
-        BackupLedger.Item item,
-        Uri uri,
-        String name,
-        String mime,
-        HashResult hashed,
-        String mediaId,
-        Map<String, String> thumbnailShas
-    ) {
-        JSObject record = new JSObject();
-        record.put("id", mediaId);
-        record.put("filename", name);
-        record.put("mimeType", mime);
-        record.put("size", hashed.size);
-        record.put("createdAt", BackupUtil.isoUtc(System.currentTimeMillis()));
-        long taken = takenMillis(item);
-        if (taken > 0) {
-            record.put("takenAt", BackupUtil.isoUtc(taken));
-        }
-
+    /** Everything the record needs, normalized like normalizeUploadRecord would. */
+    private LibraryWriter.Draft draft(BackupLedger.Item item, Uri uri, String name, String mime, HashResult hashed) {
         int width = item.width;
         int height = item.height;
         int rotation = item.orientation;
@@ -421,44 +421,27 @@ final class MediaUploader {
             width = size[0];
             height = size[1];
         }
+        int recordWidth = 0;
+        int recordHeight = 0;
         if (width > 0 && height > 0) {
             int normalized = ((rotation % 360) + 360) % 360;
             boolean swap = normalized == 90 || normalized == 270;
-            record.put("width", swap ? height : width);
-            record.put("height", swap ? width : height);
+            recordWidth = swap ? height : width;
+            recordHeight = swap ? width : height;
         }
-        if (item.isVideo() && durationMs > 0) {
-            record.put("duration", durationMs / 1000.0);
-        }
-
-        record.put("hash", "sha256:" + hashed.fileHash);
-        record.put("chunkSize", BackupUtil.CHUNK_SIZE);
-        JSONArray chunks = new JSONArray();
-        for (int i = 0; i < hashed.chunkHashes.size(); i++) {
-            String hash = hashed.chunkHashes.get(i);
-            JSObject chunk = new JSObject();
-            chunk.put("index", i);
-            chunk.put("hash", hash);
-            chunk.put("path", BackupUtil.objectPath(hash));
-            chunks.put(chunk);
-        }
-        record.put("chunks", chunks);
-        JSObject thumbnails = new JSObject();
-        for (String size : thumbnailShas.keySet()) {
-            thumbnails.put(size, "thumbnails/" + mediaId + "/" + size + ".webp");
-        }
-        record.put("thumbnails", thumbnails);
-        record.put("deletedAt", JSONObject.NULL);
-        record.put("source", "android-backup");
-        return record;
-    }
-
-    private static JSObject toJsObject(Map<String, String> map) {
-        JSObject obj = new JSObject();
-        for (Map.Entry<String, String> entry : map.entrySet()) {
-            obj.put(entry.getKey(), entry.getValue());
-        }
-        return obj;
+        JsJson.Num duration = item.isVideo() && durationMs > 0 ? JsJson.Num.secondsFromMillis(durationMs) : null;
+        return new LibraryWriter.Draft(
+            LibraryWriter.sanitizeFilename(name),
+            mime,
+            hashed.size,
+            BackupUtil.isoUtc(System.currentTimeMillis()),
+            takenAt(item),
+            recordWidth,
+            recordHeight,
+            duration,
+            FILE_HASH_PREFIX + hashed.fileHash,
+            hashed.chunkHashes
+        );
     }
 
     private static String displayName(BackupLedger.Item item) {
@@ -469,7 +452,7 @@ final class MediaUploader {
         return (item.isVideo() ? "VID_" : "IMG_") + item.mediaStoreId + (ext == null ? "" : "." + ext);
     }
 
-    /** The server only accepts image/* and video/* types. */
+    /** The library only accepts image/* and video/* types. */
     private String mimeType(BackupLedger.Item item, Uri uri, String name) {
         String mime = normalizeMime(item.mime);
         if (mime == null) {
@@ -549,9 +532,9 @@ final class MediaUploader {
         }
     }
 
-    private void checkStopped() throws ApiClient.StoppedException {
+    private void checkStopped() throws GitHubClient.StoppedException {
         if (stop.isStopped()) {
-            throw new ApiClient.StoppedException();
+            throw new GitHubClient.StoppedException();
         }
     }
 }

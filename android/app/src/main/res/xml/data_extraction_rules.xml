@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Nothing of this app moves to cloud backups or a new phone (Android 12+):
-     - app_webview/ holds the GitHub sign-in cookie; a copy on a second phone would share
-       one token, and logging out on either would sign the other out.
+     - The GitHub token lives in shared prefs (for the backup worker) and in the WebView's
+       storage under app_webview/; a copy on a second phone would share one token that
+       neither phone can revoke.
      - The backup ledger is keyed by this phone's MediaStore ids; on another phone those ids
        point at different files, which would then be skipped as "already backed up".
      The new phone simply signs in and rescans. -->

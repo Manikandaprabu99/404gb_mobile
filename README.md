@@ -1,13 +1,46 @@
 # 404GB — Android app (sideloaded, personal use only)
 
-A Capacitor wrapper around the deployed web app at https://404gb.vercel.app
-(`capacitor.config.json` → `server.url`; the site is loaded live, not bundled),
-plus one thing a web page can't do: **automatic background backup of the
-phone's photos and videos**, Google Photos style, into your own GitHub-backed
-404GB library.
+A standalone Android app for 404GB, your own Google-Photos-style gallery whose
+storage is a GitHub repo you own. **No server is involved:**
+
+- **The UI** is the 404GB web app ([Manikandaprabu99/404GB_sourcecode](https://github.com/Manikandaprabu99/404GB_sourcecode))
+  built as a static export and bundled into the APK (Capacitor serves it from
+  `https://localhost`).
+- **Your photos** are read from and written to your GitHub repo directly with
+  your own GitHub token, by both the UI and the background backup.
+- **Background backup** of the phone's photos and videos runs natively, Google
+  Photos style, and keeps going while the app is closed.
+
+The repo format is the same as before (`objects/`, `thumbnails/`, `metadata/`,
+`manifest/media-index.json`), so existing libraries keep working. The design
+and the shared contract live in the web repo's `docs/STANDALONE.md`.
 
 This is a **debug build meant only for sideloading onto your own phone**. It is
 not intended for the Play Store or anyone else's device.
+
+## Signing in (pick one)
+
+The app needs a GitHub token that can read and write your photo repo:
+
+1. **"Sign in with GitHub" (Device Flow).** Needs a GitHub OAuth App:
+   GitHub → Settings → Developer settings → OAuth Apps → New OAuth App (any
+   homepage/callback URL), then tick **Enable Device Flow** in its settings.
+   Put the app's **Client ID** (not a secret) into
+   [`config/github-client-id`](config/github-client-id) — the whole file is just
+   the id — and push; CI builds it into the app. While that file is empty the
+   app hides this option.
+2. **A personal access token**, pasted into the app. Either a classic token
+   with the `repo` scope
+   ([create one](https://github.com/settings/tokens/new?scopes=repo&description=404GB)),
+   or a fine-grained token with **Contents: read and write** (plus Metadata:
+   read) on your photo repo.
+
+The token is stored only on the phone, in app-private storage that is excluded
+from cloud backups and device transfers. Signing out forgets it on this phone
+(GitHub offers no way to revoke a Device Flow token without the OAuth App's
+secret; revoke it on GitHub under Settings → Applications if you need to). If
+GitHub stops accepting the token, backup pauses and a notification asks you to
+sign in again.
 
 ## What gets backed up
 
@@ -25,7 +58,7 @@ not intended for the Play Store or anyone else's device.
   also back up everything already on the phone (newest first) or only items
   added from now on.
 
-## How it works (and why it keeps working when the app is closed)
+## How backup works (and why it keeps working when the app is closed)
 
 Backup runs natively in Android's WorkManager, not in the web page:
 
@@ -34,20 +67,29 @@ Backup runs natively in Android's WorkManager, not in the web page:
    404GB is closed. A full safety rescan also runs every 6 hours. WorkManager
    re-registers these jobs after a reboot, so there is no always-on service.
 2. **Ledger** — every photo/video the app has seen is recorded in a small local
-   database. An item only counts as backed up after the server confirms it, so
-   nothing can be silently skipped; edited-before-upload files are re-hashed.
-3. **Upload** — files are streamed in 4 MiB chunks (never loaded into memory
-   whole, so multi-GB videos are fine). Each uploaded chunk is remembered
-   immediately, so an interrupted upload (lost signal, phone restart, Android
-   pausing the app) resumes where it stopped instead of starting over. Preview
-   thumbnails (320/800/1600 px) are made on the phone, including for HEIC
-   photos and videos.
-4. **Progress** — while uploading, a notification shows "Backing up 3 of 12"
-   with the current file. The app's settings screen shows the same status.
+   database. An item only counts as backed up after its commit landed on
+   GitHub, so nothing can be silently skipped; edited-before-upload files are
+   re-hashed.
+3. **Upload** — files are streamed in 4 MiB chunks straight to GitHub as git
+   blobs (never loaded into memory whole, so multi-GB videos are fine). Each
+   uploaded chunk is remembered immediately, so an interrupted upload (lost
+   signal, phone restart, Android pausing the app) resumes where it stopped.
+   Preview thumbnails (320/800/1600 px) are made on the phone, including for
+   HEIC photos and videos.
+4. **Commit** — a few ready items at a time go into one commit (tree, commit,
+   then a fast-forward-only branch update), built on the latest state of the
+   repo; if another device committed meanwhile, the app rebuilds on top of that
+   and tries again, re-checking for duplicates each time. Never a force-push.
+5. **Progress** — while uploading, a notification shows "Backing up 3 of 12"
+   with the current file, and the app's backup screen shows the same status.
+   An open gallery shows newly committed items right away.
 
-The upload uses your normal 404GB sign-in (the app's session cookie). If the
-session expires, backup pauses and a notification asks you to **sign in**;
-opening the app and signing in resumes it.
+**GitHub limits:** GitHub allows about 80 content-creating requests a minute
+and 500 an hour. A typical photo costs 4 (its chunk and three thumbnails) plus
+its share of the commit's 3, so an initial backup of a large library proceeds
+at roughly a hundred photos an hour. The app paces itself, and when GitHub says
+to wait it pauses and resumes by itself (the status shows "waiting" with the
+time it resumes).
 
 ### Settings
 
@@ -57,16 +99,16 @@ opening the app and signing in resumes it.
 - **Back up now** / **Retry failed** — kick off a run or re-queue items that
   failed repeatedly.
 
-When backup is waiting for Wi-Fi or charging, the status shows "waiting".
-GitHub rate limits are handled the same way: the app waits and continues.
+Like Google Photos, backup never uses mobile data while roaming and pauses
+while the battery is low.
 
 ## Save to phone and share
 
 From the gallery you can **save an original to the phone** (it appears in your
 gallery under `Pictures/404GB` or `Movies/404GB`, with its original name) or
-**share** it with any app. Both download the original chunk by chunk and verify
-its SHA-256 before the file is used; a saved item is recorded as already backed
-up, so it's never uploaded again.
+**share** it with any app. Both download the original from GitHub chunk by
+chunk and verify its SHA-256 before the file is used; a saved item is recorded
+as already backed up, so it's never uploaded again.
 
 ## Permissions and why
 
@@ -83,13 +125,26 @@ up, so it's never uploaded again.
 items, backup can't see the rest. The status shows "needs permission"; turn
 backup on again and choose **Allow all**.
 
-## Getting the APK (no Android Studio needed)
+## How the APK is built
 
 GitHub Actions builds the APK in the cloud (`.github/workflows/android-apk.yml`)
-on every push to `main` and `complete-app`. Only `main` builds are published to
-the `android-latest` release; every run also keeps the APK as a build artifact
-on the run's page. If a build fails, each compiler error is attached to the run
-as an annotation.
+on every push to `main`, `complete-app` and `standalone`:
+
+1. Checks out the web app repo at the branch with **the same name as the branch
+   being built**, or `main` when the web repo has no such branch.
+2. Runs `npm ci && npm run build` there (Node 22) with
+   `NEXT_PUBLIC_GITHUB_CLIENT_ID` taken from `config/github-client-id`, and
+   copies its static export (`out/`) to this project's `www/` (build output,
+   not committed).
+3. `npx cap sync android`, then Gradle `assembleDebug`.
+4. Uploads the APK as an artifact of the run, then runs the JVM unit tests.
+   Only `main` builds (with passing tests) are published to the
+   `android-latest` release.
+
+If a build fails, each compiler error (and any failing unit test or web-build
+error) is attached to the run as an annotation.
+
+## Getting the APK (no Android Studio needed)
 
 1. On your phone, open
    https://github.com/Manikandaprabu99/404gb_mobile/releases/download/android-latest/404gb.apk
@@ -97,7 +152,7 @@ as an annotation.
    from outside the Play Store. Download it anyway.
 3. Open the downloaded file. If Android asks, allow your browser (or Files app)
    to **Install unknown apps**, then tap **Install**.
-4. Open 404GB, sign in with GitHub, and turn on backup in the app.
+4. Open 404GB, sign in (see above), pick your photo repo, and turn on backup.
 
 To rebuild without changing code: repo → **Actions** → **Android APK** → **Run
 workflow**.
@@ -105,19 +160,26 @@ workflow**.
 **Updating:** install the new APK over the old one. Builds are signed with the
 same debug key, kept in GitHub's Actions cache. GitHub drops caches unused for 7
 days; if a build gets a new key, Android refuses the update ("App not
-installed") — uninstall the old 404GB first, then install the new one and turn
-backup back on.
+installed") — uninstall the old 404GB first, then install the new one, sign in
+and turn backup back on.
+
+**Coming from an older (server-based) build:** the old sign-in cookie isn't
+used any more. Open the app once and sign in; backup carries on with what it
+already backed up.
 
 ## Building locally (alternative)
 
-Prerequisites: Android Studio (current stable), JDK 21, Android SDK Platform 36
-(`compileSdk`/`targetSdk` 36, `minSdk` 24 — Android 7.0+).
+Prerequisites: Android Studio (current stable), JDK 21, Node 22, Android SDK
+Platform 36 (`compileSdk`/`targetSdk` 36, `minSdk` 24 — Android 7.0+).
 
-1. `npm install`, then `npx cap sync android` (regenerates files that aren't
-   committed, including the config pointing at https://404gb.vercel.app).
-2. Android Studio → **File → Open → android**, let Gradle sync.
-3. Run on a USB-connected phone, or **Build → Build APK(s)** (output in
-   `android/app/build/outputs/apk/debug/`).
+1. Build the UI: in a checkout of the web repo,
+   `NEXT_PUBLIC_GITHUB_CLIENT_ID=<your client id or empty> npm ci && npm run build`,
+   then copy its `out/` folder to this project as `www/`.
+2. Here: `npm install`, then `npx cap sync android`.
+3. Android Studio → **File → Open → android**, let Gradle sync.
+4. Run on a USB-connected phone, or **Build → Build APK(s)** (output in
+   `android/app/build/outputs/apk/debug/`). `./gradlew testDebugUnitTest` runs
+   the unit tests.
 
 ### App icon and splash
 
@@ -131,11 +193,18 @@ files under `android/app/src/main/res`.
 `android/app/src/main/java/com/fourzerofourgb/app/backup/`
 
 - `BackupPlugin` — the `Backup` Capacitor plugin used by the web app
-  (`lib/native/backup.ts`): enable/disable, options, status events, save/share.
+  (`lib/native/backup.ts`): the GitHub session (`setAuth`/`getAuth`/`clearAuth`),
+  enable/disable, options, status and `itemsUploaded` events, save/share.
 - `ScanWorker`, `BackupScheduler` — content-URI-triggered and periodic scans.
 - `MediaScanner`, `BackupLedger` — MediaStore → SQLite ledger reconciliation.
-- `UploadWorker`, `MediaUploader`, `ApiClient`, `WebCookies`, `Thumbnails` —
-  the upload engine.
+- `UploadWorker`, `MediaUploader`, `Thumbnails` — the upload engine.
+- `GitHubClient` — GitHub REST calls with retries, rate-limit handling and
+  streamed base64 blob uploads.
+- `LibraryWriter`, `LibraryIndex` — the race-safe commit (port of the web
+  app's `lib/github/transaction.ts` and `commitMediaUpload`) and the cached
+  `manifest/media-index.json`.
+- `JsJson` — JSON read and written exactly like the web app's JavaScript, so
+  manifest diffs stay one line per item (unit-tested in `src/test`).
 - `MediaDownloader` — verified downloads for save-to-phone and share.
 
 ## Known limitations

@@ -3,7 +3,11 @@ package com.fourzerofourgb.app.backup;
 import android.content.Context;
 import android.content.SharedPreferences;
 
-/** Backup settings and small bits of state that must survive process death. */
+/**
+ * Backup settings, the GitHub session, and small bits of state that must
+ * survive process death. App-private SharedPreferences: the manifest's backup
+ * rules keep all of it off cloud backups and device transfers.
+ */
 final class BackupPrefs {
 
     static final String FOLDERS_ALL = "all";
@@ -21,7 +25,55 @@ final class BackupPrefs {
     private static final String KEY_SIGN_IN_NOTIFIED = "signInNotified";
     private static final String KEY_BATTERY_PROMPTED = "batteryPrompted";
     private static final String KEY_RESUME_AT = "resumeAt";
+    private static final String KEY_RATE_LIMIT_STREAK = "rateLimitStreak";
     private static final String KEY_LIBRARY = "library";
+    private static final String KEY_AUTH_TOKEN = "authToken";
+    private static final String KEY_AUTH_LOGIN = "authLogin";
+    private static final String KEY_AUTH_OWNER = "authOwner";
+    private static final String KEY_AUTH_REPO = "authRepo";
+    private static final String KEY_AUTH_BRANCH = "authBranch";
+
+    /** The GitHub session the app and the background worker share (web: lib/native/backup.ts BackupAuth). */
+    static final class Auth {
+
+        final String token;
+        final String login;
+        final String owner;
+        final String repo;
+        final String branch;
+
+        Auth(String token, String login, String owner, String repo, String branch) {
+            this.token = token;
+            this.login = login == null ? "" : login;
+            this.owner = owner == null ? "" : owner;
+            this.repo = repo == null ? "" : repo;
+            this.branch = branch == null ? "" : branch;
+        }
+
+        /** False until a library repo has been chosen. */
+        boolean hasLibrary() {
+            return !owner.isEmpty() && !repo.isEmpty();
+        }
+
+        /** "owner/repo": the library the ledger's uploaded rows belong to. */
+        String library() {
+            return owner + "/" + repo;
+        }
+
+        /** Same token, repo and branch: everything a worker's requests depend on. */
+        boolean sameSession(Auth other) {
+            return other != null && token.equals(other.token) && owner.equals(other.owner) && repo.equals(other.repo) && branch.equals(other.branch);
+        }
+
+        /** Same repo (GitHub names are case-insensitive) and branch. */
+        boolean sameTarget(Auth other) {
+            return other != null && owner.equalsIgnoreCase(other.owner) && repo.equalsIgnoreCase(other.repo) && branch.equals(other.branch);
+        }
+
+        Auth withBranch(String newBranch) {
+            return new Auth(token, login, owner, repo, newBranch);
+        }
+    }
 
     private final SharedPreferences prefs;
 
@@ -67,6 +119,7 @@ final class BackupPrefs {
         return prefs.getLong(KEY_LAST_BACKUP_AT, 0L);
     }
 
+    /** GitHub answered 401 (or refused access) for the stored token. */
     boolean needsSignIn() {
         return prefs.getBoolean(KEY_NEEDS_SIGN_IN, false);
     }
@@ -84,9 +137,44 @@ final class BackupPrefs {
         return prefs.getLong(KEY_RESUME_AT, 0L);
     }
 
-    /** "owner/repo" the ledger's uploaded rows belong to, or null before the first upload. */
+    /** Rate-limit pauses in a row without a commit in between (grows the wait when GitHub gives none). */
+    int rateLimitStreak() {
+        return prefs.getInt(KEY_RATE_LIMIT_STREAK, 0);
+    }
+
+    /** "owner/repo" the ledger's uploaded rows belong to, or null before the first sign-in. */
     String library() {
         return prefs.getString(KEY_LIBRARY, null);
+    }
+
+    /** The stored GitHub session, or null when no token is stored. */
+    Auth auth() {
+        String token = prefs.getString(KEY_AUTH_TOKEN, null);
+        if (token == null || token.isEmpty()) {
+            return null;
+        }
+        return new Auth(
+            token,
+            prefs.getString(KEY_AUTH_LOGIN, ""),
+            prefs.getString(KEY_AUTH_OWNER, ""),
+            prefs.getString(KEY_AUTH_REPO, ""),
+            prefs.getString(KEY_AUTH_BRANCH, "")
+        );
+    }
+
+    /** A token is stored and a library repo chosen, so backup can talk to GitHub. */
+    boolean canUpload() {
+        Auth auth = auth();
+        return auth != null && auth.hasLibrary();
+    }
+
+    /** True while {@code auth} is still the stored session (same token, repo and branch). */
+    boolean isCurrent(Auth auth) {
+        return auth != null && auth.sameSession(auth());
+    }
+
+    boolean isCurrentToken(String token) {
+        return token != null && token.equals(prefs.getString(KEY_AUTH_TOKEN, null));
     }
 
     void setOptions(boolean wifiOnly, boolean chargingOnly, String folders) {
@@ -126,6 +214,41 @@ final class BackupPrefs {
         prefs.edit().putBoolean(KEY_ENABLED, false).putBoolean(KEY_NEEDS_SIGN_IN, false).apply();
     }
 
+    /** Stores the session; written synchronously so a worker starting right after sees it. */
+    void setAuth(Auth auth) {
+        synchronized (BackupPrefs.class) {
+            prefs
+                .edit()
+                .putString(KEY_AUTH_TOKEN, auth.token)
+                .putString(KEY_AUTH_LOGIN, auth.login)
+                .putString(KEY_AUTH_OWNER, auth.owner)
+                .putString(KEY_AUTH_REPO, auth.repo)
+                .putString(KEY_AUTH_BRANCH, auth.branch)
+                .commit();
+        }
+    }
+
+    /** Forgets the token only: signing in again returns to the same login and library. */
+    void clearToken() {
+        synchronized (BackupPrefs.class) {
+            prefs.edit().remove(KEY_AUTH_TOKEN).commit();
+        }
+    }
+
+    /**
+     * Fills in the branch looked up for a session stored without one; null
+     * (nothing written) when the session changed meanwhile.
+     */
+    Auth completeBranch(Auth auth, String branch) {
+        synchronized (BackupPrefs.class) {
+            if (!isCurrent(auth)) {
+                return null;
+            }
+            prefs.edit().putString(KEY_AUTH_BRANCH, branch).commit();
+            return auth.withBranch(branch);
+        }
+    }
+
     void setLastBackupAt(long epochMillis) {
         prefs.edit().putLong(KEY_LAST_BACKUP_AT, epochMillis).apply();
     }
@@ -144,6 +267,10 @@ final class BackupPrefs {
 
     void setResumeAt(long epochMillis) {
         prefs.edit().putLong(KEY_RESUME_AT, epochMillis).apply();
+    }
+
+    void setRateLimitStreak(int value) {
+        prefs.edit().putInt(KEY_RATE_LIMIT_STREAK, value).apply();
     }
 
     void setLibrary(String library) {

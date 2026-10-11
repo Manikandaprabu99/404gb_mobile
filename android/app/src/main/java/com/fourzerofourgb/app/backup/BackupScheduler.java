@@ -103,6 +103,20 @@ final class BackupScheduler {
         enqueueUpload(context, ExistingWorkPolicy.REPLACE, 0);
     }
 
+    /**
+     * Starts upload work afresh, replacing a running run (a new token or repo):
+     * the old run stops at its next request instead of finishing with stale credentials.
+     */
+    static void restartUpload(Context context) {
+        BackupPrefs.get(context).setResumeAt(0L);
+        enqueueUpload(context, ExistingWorkPolicy.REPLACE, 0);
+    }
+
+    /** Stops upload work after sign-out; setAuth schedules it again. */
+    static void cancelUpload(Context context) {
+        WorkManager.getInstance(context).cancelUniqueWork(WORK_UPLOAD);
+    }
+
     /** Ends the current run and starts a new one once GitHub's rate limit has passed. */
     static void resumeAfterRateLimit(Context context, long delayMillis) {
         BackupPrefs.get(context).setResumeAt(System.currentTimeMillis() + delayMillis);

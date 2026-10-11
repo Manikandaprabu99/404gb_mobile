@@ -13,10 +13,14 @@ import java.util.Set;
 
 /**
  * Durable record of every photo and video the backup has seen, keyed by
- * MediaStore collection + id. A row leaves "pending" only after the server
- * confirmed the commit (or reported a duplicate), so no watermark can ever
- * skip an item, and the stored chunk blob shas let an interrupted upload
- * resume without re-sending bytes.
+ * MediaStore collection + id. A row leaves "pending" only after its commit
+ * landed on GitHub (or the library turned out to have the file already), so
+ * no watermark can ever skip an item, and the stored blob shas (chunks and
+ * thumbnails) let an interrupted upload resume without re-sending bytes.
+ *
+ * The upload worker's per-item writes only apply while the row is still
+ * "uploading": if the user switched to another repo meanwhile (which resets
+ * every row), a late answer from the old repo can't mark anything done.
  */
 final class BackupLedger extends SQLiteOpenHelper {
 
@@ -61,6 +65,7 @@ final class BackupLedger extends SQLiteOpenHelper {
     private static final int DB_VERSION = 1;
     private static final String TABLE = "items";
     private static final String KEY_WHERE = COL_COLLECTION + "=? AND " + COL_MEDIA_STORE_ID + "=?";
+    private static final String UPLOADING_WHERE = KEY_WHERE + " AND " + COL_STATE + "='" + STATE_UPLOADING + "'";
     private static final String NOT_UPLOADED = COL_STATE + " IN ('" + STATE_PENDING + "','" + STATE_FAILED + "')";
     private static final int MAX_ERROR_LENGTH = 500;
 
@@ -340,19 +345,22 @@ final class BackupLedger extends SQLiteOpenHelper {
         update(item, values);
     }
 
-    /** Persists the hash and id an upload is working under, plus any chunk blob shas so far. */
-    void saveIdentity(Item item, String fileHash, String mediaId, Map<String, String> chunkShas) {
+    /**
+     * Persists the hash and id an upload is working under, plus the blob shas
+     * so far (chunk hash -> sha, and "thumb:&lt;size&gt;" -> sha).
+     */
+    void saveIdentity(Item item, String fileHash, String mediaId, Map<String, String> blobShas) {
         ContentValues values = new ContentValues();
         values.put(COL_FILE_HASH, fileHash);
         values.put(COL_MEDIA_ID, mediaId);
-        values.put(COL_CHUNK_SHAS, BackupUtil.toJson(chunkShas));
-        update(item, values);
+        values.put(COL_CHUNK_SHAS, BackupUtil.toJson(blobShas));
+        updateWhileUploading(item, values);
     }
 
-    void saveChunkShas(Item item, Map<String, String> chunkShas) {
+    void saveChunkShas(Item item, Map<String, String> blobShas) {
         ContentValues values = new ContentValues();
-        values.put(COL_CHUNK_SHAS, BackupUtil.toJson(chunkShas));
-        update(item, values);
+        values.put(COL_CHUNK_SHAS, BackupUtil.toJson(blobShas));
+        updateWhileUploading(item, values);
     }
 
     void markDone(Item item, String mediaId, String fileHash) {
@@ -370,7 +378,7 @@ final class BackupLedger extends SQLiteOpenHelper {
         values.put(COL_FILE_HASH, fileHash);
         values.putNull(COL_CHUNK_SHAS);
         values.putNull(COL_LAST_ERROR);
-        update(item, values);
+        updateWhileUploading(item, values);
     }
 
     /** Counts one failed attempt; the item is parked as failed after {@link #MAX_ATTEMPTS}. */
@@ -404,21 +412,20 @@ final class BackupLedger extends SQLiteOpenHelper {
                 " = ?" +
                 (clearChunkShas ? ", " + COL_CHUNK_SHAS + " = NULL" : "") +
                 " WHERE " +
-                KEY_WHERE,
+                UPLOADING_WHERE,
                 new Object[] { MAX_ATTEMPTS, message, System.currentTimeMillis(), item.collection, item.mediaStoreId }
             );
     }
 
-    /** Puts the item back in the queue without counting an attempt (file changed mid-upload). */
-    void requeue(Item item, boolean clearIdentity) {
+    /**
+     * Back to the queue without counting an attempt, forgetting the saved blob
+     * shas (GitHub no longer knows one of them) but keeping hash and id.
+     */
+    void requeueForReupload(Item item) {
         ContentValues values = new ContentValues();
         values.put(COL_STATE, STATE_PENDING);
-        if (clearIdentity) {
-            values.putNull(COL_FILE_HASH);
-            values.putNull(COL_MEDIA_ID);
-            values.putNull(COL_CHUNK_SHAS);
-        }
-        update(item, values);
+        values.putNull(COL_CHUNK_SHAS);
+        updateWhileUploading(item, values);
     }
 
     void delete(Item item) {
@@ -449,7 +456,8 @@ final class BackupLedger extends SQLiteOpenHelper {
      * belongs to the old one, so every backup row goes back in the queue and
      * saved blob shas (unknown to the new repo) are dropped. Rows for files
      * saved from the old library are deleted so the next scan queues those
-     * files like any other. The row being uploaded right now is left alone.
+     * files like any other. Rows being uploaded right now are reset too; the
+     * worker's own later writes to them no longer apply (see updateWhileUploading).
      */
     private void resetForNewLibrary() {
         SQLiteDatabase db = getWritableDatabase();
@@ -465,8 +473,8 @@ final class BackupLedger extends SQLiteOpenHelper {
             db.update(
                 TABLE,
                 values,
-                COL_ORIGIN + "=? AND " + COL_STATE + " IN (?,?,?,?)",
-                new String[] { ORIGIN_BACKUP, STATE_PENDING, STATE_DONE, STATE_DUPLICATE, STATE_FAILED }
+                COL_ORIGIN + "=? AND " + COL_STATE + " IN (?,?,?,?,?)",
+                new String[] { ORIGIN_BACKUP, STATE_PENDING, STATE_UPLOADING, STATE_DONE, STATE_DUPLICATE, STATE_FAILED }
             );
             db.delete(TABLE, COL_ORIGIN + "=?", new String[] { ORIGIN_DOWNLOAD });
             db.setTransactionSuccessful();
@@ -578,6 +586,12 @@ final class BackupLedger extends SQLiteOpenHelper {
     private void update(Item item, ContentValues values) {
         values.put(COL_UPDATED_AT, System.currentTimeMillis());
         getWritableDatabase().update(TABLE, values, KEY_WHERE, keyArgs(item.collection, item.mediaStoreId));
+    }
+
+    /** A worker write: only applies while the row is still the one being uploaded. */
+    private void updateWhileUploading(Item item, ContentValues values) {
+        values.put(COL_UPDATED_AT, System.currentTimeMillis());
+        getWritableDatabase().update(TABLE, values, UPLOADING_WHERE, keyArgs(item.collection, item.mediaStoreId));
     }
 
     private static String[] keyArgs(String collection, long mediaStoreId) {
