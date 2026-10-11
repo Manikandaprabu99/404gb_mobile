@@ -18,6 +18,7 @@ import java.util.concurrent.atomic.AtomicReference;
 final class WebCookies {
 
     private static final String TAG = "404gb.WebCookies";
+    private static final String SESSION_COOKIE = "404gb_session";
     private static volatile CookieManager manager;
 
     private WebCookies() {}
@@ -72,21 +73,48 @@ final class WebCookies {
         }
     }
 
-    /** Stores every Set-Cookie header value for {@code url} and flushes them to disk. */
-    static void store(String url, List<String> setCookieHeaders) {
+    /**
+     * Stores every Set-Cookie header value for {@code url} and flushes them to disk.
+     * The session cookie is only replaced if the WebView still holds the one this
+     * request was sent with ({@code sentCookieHeader}): a slow upload that finishes
+     * after the user signed in again (or out) must not bring back the old session or
+     * delete the new one.
+     */
+    static void store(String url, List<String> setCookieHeaders, String sentCookieHeader) {
         if (setCookieHeaders == null || setCookieHeaders.isEmpty()) {
             return;
         }
         try {
             CookieManager cookies = manager();
+            String sentSession = cookieValue(sentCookieHeader, SESSION_COOKIE);
+            String currentSession = cookieValue(cookies.getCookie(url), SESSION_COOKIE);
+            boolean sessionChanged = sentSession == null ? currentSession != null : !sentSession.equals(currentSession);
             for (String header : setCookieHeaders) {
-                if (header != null && !header.isEmpty()) {
-                    cookies.setCookie(url, header);
+                if (header == null || header.isEmpty()) {
+                    continue;
                 }
+                if (sessionChanged && header.trim().startsWith(SESSION_COOKIE + "=")) {
+                    continue;
+                }
+                cookies.setCookie(url, header);
             }
             cookies.flush();
         } catch (IOException | RuntimeException e) {
             Log.w(TAG, "Could not store renewed session cookie", e);
         }
+    }
+
+    /** Value of cookie {@code name} in a Cookie header ("a=1; b=2"), or null. */
+    private static String cookieValue(String cookieHeader, String name) {
+        if (cookieHeader == null) {
+            return null;
+        }
+        for (String part : cookieHeader.split(";")) {
+            String pair = part.trim();
+            if (pair.startsWith(name + "=")) {
+                return pair.substring(name.length() + 1);
+            }
+        }
+        return null;
     }
 }

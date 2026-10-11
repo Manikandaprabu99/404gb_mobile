@@ -266,7 +266,7 @@ final class ApiClient {
             }
             int status = conn.getResponseCode();
             Map<String, List<String>> headers = conn.getHeaderFields();
-            WebCookies.store(baseUrl, headerValues(headers, "Set-Cookie"));
+            WebCookies.store(baseUrl, headerValues(headers, "Set-Cookie"), cookie);
             byte[] bytes = readBody(conn, status, maxBytes);
             ok = true;
             return new Response(status, bytes, headers);
