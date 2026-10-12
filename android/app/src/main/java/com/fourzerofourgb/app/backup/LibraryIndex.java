@@ -29,6 +29,10 @@ import java.util.Set;
  * checks look up. The newest snapshot is kept in memory and in the cache dir,
  * keyed by commit sha, together with the ETag GitHub sent for it, so reading
  * an unchanged manifest at a newer commit costs a free 304.
+ *
+ * Trashed entries (with trashedAt) stay in the index and count like any other:
+ * a file whose copy is in Trash is still a duplicate. Fields the phone doesn't
+ * know are kept, since entries are only ever rewritten from their parsed line.
  */
 final class LibraryIndex {
 
@@ -57,6 +61,7 @@ final class LibraryIndex {
     private final List<String> lines;
     private final List<String> ids;
     private final BitSet dated;
+    private final BitSet foldered;
     private final Map<String, Integer> firstByHash;
     private final Set<String> idSet;
 
@@ -67,6 +72,7 @@ final class LibraryIndex {
         this.lines = content.lines;
         this.ids = content.ids;
         this.dated = content.dated;
+        this.foldered = content.foldered;
         this.firstByHash = content.firstByHash;
         this.idSet = content.idSet;
     }
@@ -94,6 +100,11 @@ final class LibraryIndex {
     /** Whether the entry has a capture date (a truthy takenAt). */
     boolean isDated(int index) {
         return dated.get(index);
+    }
+
+    /** Whether the entry has a folder property (whatever its value, so it is never overwritten). */
+    boolean hasFolder(int index) {
+        return foldered.get(index);
     }
 
     /** The same content at another commit (GitHub answered 304 for it). */
@@ -130,29 +141,45 @@ final class LibraryIndex {
         private final List<String> lines;
         private final List<String> ids;
         private final BitSet dated;
+        private final BitSet foldered;
         private final Map<String, Integer> firstByHash;
         private final Set<String> idSet;
 
         Builder() {
-            this(new ArrayList<String>(), new ArrayList<String>(), new BitSet(), new HashMap<String, Integer>(), new HashSet<String>());
+            this(
+                new ArrayList<String>(),
+                new ArrayList<String>(),
+                new BitSet(),
+                new BitSet(),
+                new HashMap<String, Integer>(),
+                new HashSet<String>()
+            );
         }
 
         /** A modifiable copy of {@code base}. */
         Builder(LibraryIndex base) {
-            this(new ArrayList<>(base.lines), new ArrayList<>(base.ids), (BitSet) base.dated.clone(), new HashMap<>(base.firstByHash), new HashSet<>(base.idSet));
+            this(
+                new ArrayList<>(base.lines),
+                new ArrayList<>(base.ids),
+                (BitSet) base.dated.clone(),
+                (BitSet) base.foldered.clone(),
+                new HashMap<>(base.firstByHash),
+                new HashSet<>(base.idSet)
+            );
         }
 
-        private Builder(List<String> lines, List<String> ids, BitSet dated, Map<String, Integer> firstByHash, Set<String> idSet) {
+        private Builder(List<String> lines, List<String> ids, BitSet dated, BitSet foldered, Map<String, Integer> firstByHash, Set<String> idSet) {
             this.lines = lines;
             this.ids = ids;
             this.dated = dated;
+            this.foldered = foldered;
             this.firstByHash = firstByHash;
             this.idSet = idSet;
         }
 
         /** Read-only reuse of a snapshot's content (it is never modified). */
         static Builder sharing(LibraryIndex index) {
-            return new Builder(index.lines, index.ids, index.dated, index.firstByHash, index.idSet);
+            return new Builder(index.lines, index.ids, index.dated, index.foldered, index.firstByHash, index.idSet);
         }
 
         @Override
@@ -182,6 +209,7 @@ final class LibraryIndex {
         private void describe(int index, Object entry) {
             String id = null;
             boolean hasDate = false;
+            boolean hasFolder = false;
             if (entry instanceof Map) {
                 Map<?, ?> map = (Map<?, ?>) entry;
                 Object idValue = map.get("id");
@@ -193,12 +221,14 @@ final class LibraryIndex {
                     firstByHash.put((String) hash, index);
                 }
                 hasDate = JsJson.truthy(map.get("takenAt"));
+                hasFolder = map.containsKey("folder");
             }
             ids.set(index, id);
             if (id != null) {
                 idSet.add(id);
             }
             dated.set(index, hasDate);
+            foldered.set(index, hasFolder);
         }
 
         /** The parsed entry at {@code index}. */
@@ -224,6 +254,10 @@ final class LibraryIndex {
             return dated.get(index);
         }
 
+        boolean hasFolder(int index) {
+            return foldered.get(index);
+        }
+
         boolean hasId(String id) {
             return idSet.contains(id);
         }
@@ -237,6 +271,23 @@ final class LibraryIndex {
             for (int i = 0; i < ids.size(); i++) {
                 if (id.equals(ids.get(i))) {
                     found.add(i);
+                }
+            }
+            return found;
+        }
+
+        /** Every position of each of {@code wanted}, in order, from one pass over the index. */
+        Map<String, List<Integer>> indexesOfIds(Set<String> wanted) {
+            Map<String, List<Integer>> found = new HashMap<>();
+            for (int i = 0; i < ids.size(); i++) {
+                String id = ids.get(i);
+                if (id != null && wanted.contains(id)) {
+                    List<Integer> positions = found.get(id);
+                    if (positions == null) {
+                        positions = new ArrayList<>(1);
+                        found.put(id, positions);
+                    }
+                    positions.add(i);
                 }
             }
             return found;

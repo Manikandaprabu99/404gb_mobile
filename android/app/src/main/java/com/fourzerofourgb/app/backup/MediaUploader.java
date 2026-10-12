@@ -440,7 +440,8 @@ final class MediaUploader {
             recordHeight,
             duration,
             FILE_HASH_PREFIX + hashed.fileHash,
-            hashed.chunkHashes
+            hashed.chunkHashes,
+            BackupUtil.normalizeFolder(item.folder)
         );
     }
 

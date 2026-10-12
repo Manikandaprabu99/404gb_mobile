@@ -29,7 +29,9 @@ import java.util.concurrent.TimeoutException;
  * uploading it asks to run as a dataSync foreground service with a progress
  * notification; if Android refuses (background start limits) it keeps going
  * as a normal worker, and if it is stopped the ledger lets the next run resume
- * where this one left off.
+ * where this one left off. Once nothing is left to upload it runs the one-time
+ * folder backfill (see {@link FolderBackfill}), which steps aside whenever new
+ * items are queued.
  */
 public final class UploadWorker extends Worker {
 
@@ -120,7 +122,7 @@ public final class UploadWorker extends Worker {
             github.setWaitListener(waiting -> BackupStatus.setRateLimited(context, waiting));
             library = new LibraryWriter(context, github);
             uploader = new MediaUploader(context, ledger, github, library, this::isStopped);
-            drain();
+            drainAndBackfill(new FolderBackfill(context, ledger, library, LibraryIndex.libraryKey(auth), this::isStopped));
         } catch (GitHubClient.AuthRequiredException e) {
             Log.w(TAG, "GitHub refused the token", e);
             ledger.resetInterrupted();
@@ -160,6 +162,27 @@ public final class UploadWorker extends Worker {
             return Result.retry();
         }
         return Result.success();
+    }
+
+    /**
+     * Uploads everything queued, then gives items backed up before uploads
+     * carried their folder that folder (once per library). New items queued
+     * meanwhile (a content-triggered scan) interrupt the backfill and are
+     * uploaded first; it then carries on from what the branch head says.
+     */
+    private void drainAndBackfill(FolderBackfill backfill) throws IOException {
+        while (true) {
+            drain();
+            if (isStopped() || !prefs.isEnabled() || !backfill.isNeeded()) {
+                return;
+            }
+            // Index-only commits: not an upload the status should show.
+            BackupStatus.setUploading(context, false);
+            if (!backfill.run(() -> ledger.nextPending(skip) != null)) {
+                return;
+            }
+            BackupStatus.setUploading(context, true);
+        }
     }
 
     private void drain() throws IOException {

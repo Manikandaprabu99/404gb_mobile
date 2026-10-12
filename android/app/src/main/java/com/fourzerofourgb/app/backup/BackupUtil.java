@@ -13,6 +13,7 @@ import java.util.Iterator;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TimeZone;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -26,6 +27,13 @@ final class BackupUtil {
     private static final Pattern HEX_SHA256 = Pattern.compile("^[0-9a-f]{64}$");
     private static final Pattern MEDIA_ID = Pattern.compile("^media_[A-Za-z0-9_-]{1,80}$");
     private static final SecureRandom RANDOM = new SecureRandom();
+    // Where storage volumes were mounted before Android 10: the primary one
+    // (/storage/emulated/0, /sdcard…), SD cards and USB drives (/storage/1234-ABCD).
+    private static final Pattern VOLUME_ROOT = Pattern.compile(
+        "^/(?:storage/emulated/\\d+|storage/self/primary|storage/[^/]+|mnt/media_rw/[^/]+|mnt/[^/]+|sdcard\\d*)/"
+    );
+    /** A longer folder is not a real one; it is left out like an unknown folder. */
+    private static final int MAX_FOLDER_LENGTH = 1024;
 
     private BackupUtil() {}
 
@@ -96,6 +104,51 @@ final class BackupUtil {
             sb.append(Character.forDigit(RANDOM.nextInt(36), 36));
         }
         return sb.toString();
+    }
+
+    /**
+     * A device folder as MediaRecord.folder stores it: relative to its storage
+     * volume, "/"-separated, without empty parts or a leading or trailing slash
+     * ("DCIM/Camera"). Null when there is none (the volume root) or it is unknown.
+     */
+    static String normalizeFolder(String path) {
+        if (path == null) {
+            return null;
+        }
+        StringBuilder out = new StringBuilder(path.length());
+        for (String part : path.split("/")) {
+            if (part.isEmpty()) {
+                continue;
+            }
+            if (out.length() > 0) {
+                out.append('/');
+            }
+            out.append(part);
+        }
+        return out.length() == 0 || out.length() > MAX_FOLDER_LENGTH ? null : out.toString();
+    }
+
+    /** MediaStore RELATIVE_PATH (Android 10+), e.g. "DCIM/Camera/", as a folder ("DCIM/Camera"). */
+    static String folderFromRelativePath(String relativePath) {
+        return normalizeFolder(relativePath);
+    }
+
+    /**
+     * The folder of a MediaStore DATA file path (before Android 10), relative to
+     * its storage volume: "/storage/emulated/0/DCIM/Camera/IMG_1.jpg" gives
+     * "DCIM/Camera". Null for a path outside the known volume roots.
+     */
+    static String folderFromDataPath(String data) {
+        if (data == null) {
+            return null;
+        }
+        int slash = data.lastIndexOf('/');
+        if (slash <= 0) {
+            return null;
+        }
+        String dir = data.substring(0, slash + 1);
+        Matcher root = VOLUME_ROOT.matcher(dir);
+        return root.find() ? normalizeFolder(dir.substring(root.end())) : null;
     }
 
     /** ISO 8601 in UTC with milliseconds, matching JavaScript's Date.toISOString(). */

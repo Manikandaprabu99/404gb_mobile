@@ -8,10 +8,13 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.regex.Pattern;
 import org.json.JSONArray;
@@ -24,7 +27,8 @@ import org.json.JSONObject;
  * it, commit, and move the branch only as a fast-forward; when someone else
  * committed meanwhile, start over from the new head. Duplicate checks run again
  * inside every attempt, so two devices uploading the same file at once still
- * add one entry.
+ * add one entry; so do the checks of date and folder fixes, which never
+ * overwrite a value someone else set meanwhile.
  */
 final class LibraryWriter {
 
@@ -74,6 +78,24 @@ final class LibraryWriter {
         }
     }
 
+    /**
+     * A device folder for an indexed item whose entry has none (the folder
+     * backfill). Only the index entry changes; the metadata record is left as
+     * it is, which saves reading every record (see FolderBackfill).
+     */
+    static final class FolderFix extends Op {
+
+        final String mediaId;
+        final String folder;
+
+        /** {@code fileHash} must be the entry's hash: an entry with other bytes is left alone. */
+        FolderFix(Object tag, String fileHash, String mediaId, String folder) {
+            super(tag, fileHash);
+            this.mediaId = mediaId;
+            this.folder = folder;
+        }
+    }
+
     enum Kind {
         /** Stored as a new library item. */
         ADDED,
@@ -83,7 +105,9 @@ final class LibraryWriter {
         DUPLICATE,
         /** Its capture date was set. */
         DATE_SET,
-        /** Nothing to do: the item already has a date, or is gone. */
+        /** Its folder was set. */
+        FOLDER_SET,
+        /** Nothing to do: the item already has a date (or folder), is gone, or holds other bytes. */
         UNCHANGED,
     }
 
@@ -154,6 +178,8 @@ final class LibraryWriter {
         final JsJson.Num duration;
         final String hash;
         final List<String> chunkHashes;
+        /** Device folder (BackupUtil.normalizeFolder), or null when unknown. */
+        final String folder;
 
         Draft(
             String filename,
@@ -165,7 +191,8 @@ final class LibraryWriter {
             int height,
             JsJson.Num duration,
             String hash,
-            List<String> chunkHashes
+            List<String> chunkHashes,
+            String folder
         ) {
             this.filename = filename;
             this.mimeType = mimeType;
@@ -177,9 +204,14 @@ final class LibraryWriter {
             this.duration = duration;
             this.hash = hash;
             this.chunkHashes = chunkHashes;
+            this.folder = folder;
         }
 
-        /** The record with keys in normalizeUploadRecord's order (unset fields left out, as JSON.stringify does). */
+        /**
+         * The record with keys in normalizeUploadRecord's order (unset fields
+         * left out, as JSON.stringify does); folder goes where MediaRecord
+         * declares it, after source.
+         */
         Map<String, Object> record(String id, Iterable<Integer> thumbnailSizes) {
             Map<String, Object> record = new LinkedHashMap<>();
             record.put("id", id);
@@ -217,6 +249,9 @@ final class LibraryWriter {
             }
             record.put("thumbnails", thumbnails);
             record.put("source", "android-backup");
+            if (folder != null) {
+                record.put("folder", folder);
+            }
             record.put("deletedAt", JsJson.NULL);
             return record;
         }
@@ -275,12 +310,14 @@ final class LibraryWriter {
         for (int attempt = 1; ; attempt++) {
             GitHubClient.Head head = head(false);
             String baseTree = treeOf(head.sha);
-            Change change = new Change(indexAt(head.sha), head.sha);
+            Change change = new Change(indexAt(head.sha), head.sha, ops);
             for (Op op : ops) {
                 if (op instanceof NewItem) {
                     change.add((NewItem) op);
-                } else {
+                } else if (op instanceof DateFix) {
                     change.fixDate((DateFix) op);
+                } else {
+                    change.fixFolder((FolderFix) op);
                 }
             }
             if (!change.changed) {
@@ -311,11 +348,21 @@ final class LibraryWriter {
         final List<String[]> textItems = new ArrayList<>();
         final List<String> addedNames = new ArrayList<>();
         final List<String> datedNames = new ArrayList<>();
+        final List<String> folderNames = new ArrayList<>();
+        /** Positions of the entries folder fixes target, found in one pass (added entries only go after them). */
+        final Map<String, List<Integer>> folderTargets;
         boolean changed;
 
-        Change(LibraryIndex index, String headSha) {
+        Change(LibraryIndex index, String headSha, List<Op> ops) {
             this.entries = new LibraryIndex.Builder(index);
             this.headSha = headSha;
+            Set<String> folderIds = new HashSet<>();
+            for (Op op : ops) {
+                if (op instanceof FolderFix) {
+                    folderIds.add(((FolderFix) op).mediaId);
+                }
+            }
+            this.folderTargets = folderIds.isEmpty() ? Collections.<String, List<Integer>>emptyMap() : entries.indexesOfIds(folderIds);
         }
 
         /** commitMediaUpload's step: skip a file the index has, avoid id clashes, add record and entry. */
@@ -353,6 +400,40 @@ final class LibraryWriter {
         void fixDate(DateFix fix) throws IOException {
             boolean set = setDate(fix.mediaId, fix.takenAt);
             outcomes.add(new Outcome(fix, set ? Kind.DATE_SET : Kind.UNCHANGED, fix.mediaId, null));
+        }
+
+        /**
+         * Adds the folder to the entries with this id, checked again in every
+         * attempt: only an entry for the same bytes (hash) that has no folder
+         * property yet, so a folder set by anyone else is never overwritten.
+         */
+        void fixFolder(FolderFix fix) {
+            boolean set = false;
+            Object filename = null;
+            List<Integer> positions = folderTargets.get(fix.mediaId);
+            if (positions != null) {
+                for (int position : positions) {
+                    if (entries.hasFolder(position)) {
+                        continue;
+                    }
+                    Object entry = entries.entry(position);
+                    if (!(entry instanceof Map)) {
+                        continue;
+                    }
+                    Map<?, ?> map = (Map<?, ?>) entry;
+                    if (!fix.mediaId.equals(map.get("id")) || !fix.fileHash.equals(map.get("hash"))) {
+                        continue;
+                    }
+                    entries.replace(position, withFolder(map, fix.folder));
+                    filename = map.get("filename");
+                    set = true;
+                }
+            }
+            if (set) {
+                folderNames.add(jsString(filename));
+                changed = true;
+            }
+            outcomes.add(new Outcome(fix, set ? Kind.FOLDER_SET : Kind.UNCHANGED, fix.mediaId, null));
         }
 
         /** setTakenAtIfMissing within this attempt: index entry and metadata, never overwriting a date. */
@@ -402,9 +483,14 @@ final class LibraryWriter {
             if (!addedNames.isEmpty()) {
                 return addedNames.size() == 1 ? "404gb: upload " + addedNames.get(0) : "404gb: upload " + addedNames.size() + " items";
             }
-            return datedNames.size() == 1
-                ? "404gb: set capture date of " + datedNames.get(0)
-                : "404gb: set capture date of " + datedNames.size() + " items";
+            if (!datedNames.isEmpty()) {
+                return datedNames.size() == 1
+                    ? "404gb: set capture date of " + datedNames.get(0)
+                    : "404gb: set capture date of " + datedNames.size() + " items";
+            }
+            return folderNames.size() == 1
+                ? "404gb: set folder of " + folderNames.get(0)
+                : "404gb: set folder of " + folderNames.size() + " items";
         }
 
         /**
@@ -556,7 +642,34 @@ final class LibraryWriter {
             entry.put("duration", record.get("duration"));
         }
         putIfSet(entry, "size", record.get("size"));
+        if (JsJson.truthy(record.get("favorite"))) {
+            entry.put("favorite", Boolean.TRUE);
+        }
+        putIfSet(entry, "editedFrom", record.get("editedFrom"));
+        putIfSet(entry, "folder", record.get("folder"));
+        putIfSet(entry, "trashedAt", record.get("trashedAt"));
         return entry;
+    }
+
+    /**
+     * An existing entry plus {@code folder}, every other property kept as it
+     * is. The folder goes where toIndexEntry puts it: before trashedAt (which
+     * comes last) when the entry has one, else at the end.
+     */
+    static Map<String, Object> withFolder(Map<?, ?> entry, String folder) {
+        Map<String, Object> updated = new LinkedHashMap<>();
+        boolean placed = false;
+        for (Map.Entry<?, ?> property : entry.entrySet()) {
+            if (!placed && "trashedAt".equals(property.getKey())) {
+                updated.put("folder", folder);
+                placed = true;
+            }
+            updated.put((String) property.getKey(), property.getValue());
+        }
+        if (!placed) {
+            updated.put("folder", folder);
+        }
+        return updated;
     }
 
     private static void putIfSet(Map<String, Object> map, String key, Object value) {

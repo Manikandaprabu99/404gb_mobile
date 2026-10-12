@@ -27,6 +27,7 @@ final class BackupPrefs {
     private static final String KEY_RESUME_AT = "resumeAt";
     private static final String KEY_RATE_LIMIT_STREAK = "rateLimitStreak";
     private static final String KEY_LIBRARY = "library";
+    private static final String KEY_FOLDER_BACKFILL_DONE = "folderBackfillDone";
     private static final String KEY_AUTH_TOKEN = "authToken";
     private static final String KEY_AUTH_LOGIN = "authLogin";
     private static final String KEY_AUTH_OWNER = "authOwner";
@@ -145,6 +146,15 @@ final class BackupPrefs {
     /** "owner/repo" the ledger's uploaded rows belong to, or null before the first sign-in. */
     String library() {
         return prefs.getString(KEY_LIBRARY, null);
+    }
+
+    /**
+     * Whether the folder backfill finished for this library (LibraryIndex.libraryKey,
+     * "owner/repo@branch"). Only the last finished library is remembered: going
+     * back to an earlier one runs the (idempotent) backfill there once more.
+     */
+    boolean folderBackfillDone(String library) {
+        return library.equals(prefs.getString(KEY_FOLDER_BACKFILL_DONE, null));
     }
 
     /** The stored GitHub session, or null when no token is stored. */
@@ -275,5 +285,9 @@ final class BackupPrefs {
 
     void setLibrary(String library) {
         prefs.edit().putString(KEY_LIBRARY, library).apply();
+    }
+
+    void setFolderBackfillDone(String library) {
+        prefs.edit().putString(KEY_FOLDER_BACKFILL_DONE, library).apply();
     }
 }

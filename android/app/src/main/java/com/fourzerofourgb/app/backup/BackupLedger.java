@@ -6,6 +6,7 @@ import android.database.Cursor;
 import android.database.DatabaseUtils;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -60,13 +61,18 @@ final class BackupLedger extends SQLiteOpenHelper {
     static final String COL_LAST_ERROR = "last_error";
     static final String COL_ORIGIN = "origin";
     static final String COL_UPDATED_AT = "updated_at";
+    /** Device folder (MediaRecord.folder, e.g. "DCIM/Camera"); null when unknown. Added in version 2. */
+    static final String COL_FOLDER = "folder";
 
     private static final String DB_NAME = "404gb_backup.db";
-    private static final int DB_VERSION = 1;
+    private static final int DB_VERSION = 2;
     private static final String TABLE = "items";
     private static final String KEY_WHERE = COL_COLLECTION + "=? AND " + COL_MEDIA_STORE_ID + "=?";
     private static final String UPLOADING_WHERE = KEY_WHERE + " AND " + COL_STATE + "='" + STATE_UPLOADING + "'";
     private static final String NOT_UPLOADED = COL_STATE + " IN ('" + STATE_PENDING + "','" + STATE_FAILED + "')";
+    private static final String UPLOADED = COL_STATE + " IN ('" + STATE_DONE + "','" + STATE_DUPLICATE + "')";
+    // A queued row follows its file around; an uploaded row keeps the folder it was uploaded from.
+    private static final String FOLDER_UPDATABLE = "(" + COL_FOLDER + " IS NULL OR " + NOT_UPLOADED + ")";
     private static final int MAX_ERROR_LENGTH = 500;
 
     private static volatile BackupLedger instance;
@@ -140,6 +146,8 @@ final class BackupLedger extends SQLiteOpenHelper {
             "', " +
             COL_UPDATED_AT +
             " INTEGER NOT NULL, " +
+            COL_FOLDER +
+            " TEXT, " +
             "PRIMARY KEY (" +
             COL_COLLECTION +
             ", " +
@@ -152,7 +160,12 @@ final class BackupLedger extends SQLiteOpenHelper {
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        // Version 1 is the only schema so far.
+        // SQLiteOpenHelper runs this in a transaction: either every step lands or none.
+        if (oldVersion < 2) {
+            // Version 2: the device folder. Existing rows keep everything and get a NULL
+            // folder, which the next scan (or the folder backfill) fills in from MediaStore.
+            db.execSQL("ALTER TABLE " + TABLE + " ADD COLUMN " + COL_FOLDER + " TEXT");
+        }
     }
 
     /** One ledger row. */
@@ -180,6 +193,8 @@ final class BackupLedger extends SQLiteOpenHelper {
         String mediaId;
         String chunkShasJson;
         String lastError;
+        /** MediaRecord.folder ("DCIM/Camera"), or null when unknown. */
+        String folder;
 
         String key() {
             return collection + ":" + mediaStoreId;
@@ -196,11 +211,14 @@ final class BackupLedger extends SQLiteOpenHelper {
         final String state;
         final long size;
         final long dateModified;
+        /** Null when not known yet. */
+        final String folder;
 
-        Snapshot(String state, long size, long dateModified) {
+        Snapshot(String state, long size, long dateModified, String folder) {
             this.state = state;
             this.size = size;
             this.dateModified = dateModified;
+            this.folder = folder;
         }
 
         boolean isUploaded() {
@@ -232,30 +250,51 @@ final class BackupLedger extends SQLiteOpenHelper {
         int failed;
     }
 
+    /** An uploaded backup row, as the folder backfill sees it. */
+    static final class UploadedRow {
+
+        final String mediaId;
+        /** Whole-file sha256 hex (no "sha256:" prefix). */
+        final String fileHash;
+        /** Null when unknown. */
+        final String folder;
+        /** Uploaded by this phone (done), rather than found in the library already (duplicate). */
+        final boolean done;
+
+        UploadedRow(String mediaId, String fileHash, String folder, boolean done) {
+            this.mediaId = mediaId;
+            this.fileHash = fileHash;
+            this.folder = folder;
+            this.done = done;
+        }
+    }
+
     // ---- scanning ----
 
     Map<Long, Snapshot> snapshot(String collection) {
         Map<Long, Snapshot> out = new HashMap<>();
-        String[] columns = { COL_MEDIA_STORE_ID, COL_STATE, COL_SIZE, COL_DATE_MODIFIED };
+        String[] columns = { COL_MEDIA_STORE_ID, COL_STATE, COL_SIZE, COL_DATE_MODIFIED, COL_FOLDER };
         try (
             Cursor c = getReadableDatabase().query(TABLE, columns, COL_COLLECTION + "=?", new String[] { collection }, null, null, null)
         ) {
             while (c.moveToNext()) {
-                out.put(c.getLong(0), new Snapshot(c.getString(1), c.getLong(2), c.getLong(3)));
+                out.put(c.getLong(0), new Snapshot(c.getString(1), c.getLong(2), c.getLong(3), c.isNull(4) ? null : c.getString(4)));
             }
         }
         return out;
     }
 
     /**
-     * Inserts newly discovered rows as pending and refreshes rows whose file
-     * changed before it was uploaded. Updates are conditional on the row still
-     * not being uploaded, so a scan racing the upload worker can't undo a commit.
+     * Inserts newly discovered rows as pending, refreshes rows whose file
+     * changed before it was uploaded, and records folders ({@code folders}
+     * rows carry only {@link #COL_FOLDER}). Updates are conditional on the row
+     * still not being uploaded, so a scan racing the upload worker can't undo a
+     * commit; an uploaded row only gets a folder it doesn't have yet.
      *
      * @return how many rows were newly queued
      */
-    int applyScan(String collection, List<ScanRow> inserts, List<ScanRow> resets) {
-        if (inserts.isEmpty() && resets.isEmpty()) {
+    int applyScan(String collection, List<ScanRow> inserts, List<ScanRow> resets, List<ScanRow> folders) {
+        if (inserts.isEmpty() && resets.isEmpty() && folders.isEmpty()) {
             return 0;
         }
         int inserted = 0;
@@ -270,11 +309,45 @@ final class BackupLedger extends SQLiteOpenHelper {
             for (ScanRow row : resets) {
                 db.update(TABLE, row.values, KEY_WHERE + " AND " + NOT_UPLOADED, keyArgs(collection, row.mediaStoreId));
             }
+            for (ScanRow row : folders) {
+                db.update(TABLE, row.values, KEY_WHERE + " AND " + FOLDER_UPDATABLE, keyArgs(collection, row.mediaStoreId));
+            }
             db.setTransactionSuccessful();
         } finally {
             db.endTransaction();
         }
         return inserted;
+    }
+
+    /** MediaStore ids of uploaded backup rows whose folder isn't known yet. */
+    List<Long> uploadedWithoutFolder(String collection) {
+        List<Long> out = new ArrayList<>();
+        String[] columns = { COL_MEDIA_STORE_ID };
+        String where =
+            COL_COLLECTION + "=? AND " + COL_ORIGIN + "=? AND " + UPLOADED + " AND " + COL_FOLDER + " IS NULL AND " + COL_MEDIA_ID + " IS NOT NULL";
+        try (Cursor c = getReadableDatabase().query(TABLE, columns, where, new String[] { collection, ORIGIN_BACKUP }, null, null, null)) {
+            while (c.moveToNext()) {
+                out.add(c.getLong(0));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Every uploaded backup row with a library id and hash. Rows for files saved
+     * from the library onto the phone are left out: their folder is where the
+     * app saved them, not where the library item came from.
+     */
+    List<UploadedRow> uploadedRows() {
+        List<UploadedRow> out = new ArrayList<>();
+        String[] columns = { COL_MEDIA_ID, COL_FILE_HASH, COL_FOLDER, COL_STATE };
+        String where = COL_ORIGIN + "=? AND " + UPLOADED + " AND " + COL_MEDIA_ID + " IS NOT NULL AND " + COL_FILE_HASH + " IS NOT NULL";
+        try (Cursor c = getReadableDatabase().query(TABLE, columns, where, new String[] { ORIGIN_BACKUP }, null, null, null)) {
+            while (c.moveToNext()) {
+                out.add(new UploadedRow(c.getString(0), c.getString(1), c.isNull(2) ? null : c.getString(2), STATE_DONE.equals(c.getString(3))));
+            }
+        }
+        return out;
     }
 
     /** Drops queued rows whose MediaStore item is gone or no longer matches the folder setting. */
@@ -619,6 +692,8 @@ final class BackupLedger extends SQLiteOpenHelper {
         item.mediaId = c.getString(c.getColumnIndexOrThrow(COL_MEDIA_ID));
         item.chunkShasJson = c.getString(c.getColumnIndexOrThrow(COL_CHUNK_SHAS));
         item.lastError = c.getString(c.getColumnIndexOrThrow(COL_LAST_ERROR));
+        int folder = c.getColumnIndexOrThrow(COL_FOLDER);
+        item.folder = c.isNull(folder) ? null : c.getString(folder);
         return item;
     }
 }
