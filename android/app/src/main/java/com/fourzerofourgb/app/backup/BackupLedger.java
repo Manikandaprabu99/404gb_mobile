@@ -269,6 +269,26 @@ final class BackupLedger extends SQLiteOpenHelper {
         }
     }
 
+    /** An image on this phone whose bytes are a library item, as the scan last saw it. */
+    static final class LocalCopy {
+
+        final String uri;
+        final long size;
+        /** Epoch seconds; for a saved copy, when it was saved rather than MediaStore's value. */
+        final long dateModified;
+        final int orientation;
+        /** Saved from the library onto this phone, rather than backed up from it. */
+        final boolean downloaded;
+
+        LocalCopy(String uri, long size, long dateModified, int orientation, boolean downloaded) {
+            this.uri = uri;
+            this.size = size;
+            this.dateModified = dateModified;
+            this.orientation = orientation;
+            this.downloaded = downloaded;
+        }
+    }
+
     // ---- scanning ----
 
     Map<Long, Snapshot> snapshot(String collection) {
@@ -625,6 +645,42 @@ final class BackupLedger extends SQLiteOpenHelper {
 
     void deleteRow(String collection, long mediaStoreId) {
         getWritableDatabase().delete(TABLE, KEY_WHERE, keyArgs(collection, mediaStoreId));
+    }
+
+    // ---- local copies (background People matching) ----
+
+    /**
+     * Looks rows up by library id. Created when first needed rather than in a
+     * schema upgrade, so an older build can still open the database.
+     */
+    void ensureMediaIdIndex() {
+        getWritableDatabase().execSQL("CREATE INDEX IF NOT EXISTS items_media_id ON " + TABLE + " (" + COL_MEDIA_ID + ")");
+    }
+
+    /**
+     * Images on this phone whose bytes are library item {@code mediaId}: backed
+     * up from here, found in the library already, or saved from it.
+     */
+    List<LocalCopy> localImages(String mediaId) {
+        List<LocalCopy> out = new ArrayList<>();
+        String[] columns = { COL_URI, COL_SIZE, COL_DATE_MODIFIED, COL_ORIENTATION, COL_ORIGIN };
+        String where = COL_MEDIA_ID + "=? AND " + COL_COLLECTION + "=? AND " + UPLOADED;
+        try (
+            Cursor c = getReadableDatabase().query(TABLE, columns, where, new String[] { mediaId, COLLECTION_IMAGES }, null, null, null, "4")
+        ) {
+            while (c.moveToNext()) {
+                out.add(new LocalCopy(c.getString(0), c.getLong(1), c.getLong(2), c.getInt(3), ORIGIN_DOWNLOAD.equals(c.getString(4))));
+            }
+        }
+        return out;
+    }
+
+    /** True when some image on this phone is known to be a library item (see {@link #localImages}). */
+    boolean hasLocalImages() {
+        String where = COL_COLLECTION + "=? AND " + UPLOADED + " AND " + COL_MEDIA_ID + " IS NOT NULL";
+        try (Cursor c = getReadableDatabase().query(TABLE, new String[] { COL_MEDIA_ID }, where, new String[] { COLLECTION_IMAGES }, null, null, null, "1")) {
+            return c.moveToFirst();
+        }
     }
 
     Counts counts() {

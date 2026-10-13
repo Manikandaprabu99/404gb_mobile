@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import com.fourzerofourgb.app.MainActivity;
 import com.fourzerofourgb.app.R;
+import java.text.NumberFormat;
 
 final class BackupNotifications {
 
@@ -19,6 +20,7 @@ final class BackupNotifications {
     static final String CHANNEL_ATTENTION = "backup_attention";
     static final int ID_PROGRESS = 4404;
     static final int ID_SIGN_IN = 4405;
+    static final int ID_FACES = 4406;
 
     private static final String TAG = "404gb.Notifications";
 
@@ -74,6 +76,35 @@ final class BackupNotifications {
         if (bytesTotal > 0) {
             int permille = (int) Math.min(1000L, Math.max(0L, bytesDone) * 1000L / bytesTotal);
             builder.setProgress(1000, permille, false);
+        } else {
+            builder.setProgress(0, 0, true);
+        }
+        return builder.build();
+    }
+
+    /**
+     * "Finding people in your photos" with "1,240 of 8,000 photos" once the
+     * runner reports progress. Android 12+ shows it only after the run has been
+     * going for a few seconds, so a run with nothing to do never flashes it.
+     */
+    static Notification faces(Context context, int checked, int total) {
+        ensureChannels(context);
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(context, CHANNEL_PROGRESS)
+            .setSmallIcon(R.drawable.ic_stat_404gb)
+            .setContentTitle(context.getString(R.string.faces_progress_title))
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setShowWhen(false)
+            .setLocalOnly(true)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(openApp(context));
+        if (total > 0) {
+            int done = Math.max(0, Math.min(checked, total));
+            NumberFormat count = NumberFormat.getIntegerInstance();
+            builder.setContentText(context.getString(R.string.faces_progress_count, count.format(done), count.format(total)));
+            builder.setProgress(1000, (int) (done * 1000L / total), false);
         } else {
             builder.setProgress(0, 0, true);
         }

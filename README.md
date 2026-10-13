@@ -102,6 +102,31 @@ time it resumes).
 Like Google Photos, backup never uses mobile data while roaming and pauses
 while the battery is low.
 
+## People matching in the background
+
+The app finds faces in your photos on the phone (the web repo's
+`docs/FACES.md`). While the app is open its own scanner does that; while the
+phone **charges with the app closed**, the same scanner keeps going in the
+background, so a big library doesn't need the app left open for days:
+
+- **When:** about once an hour (WorkManager), only while charging with the
+  battery not low and online (on Wi-Fi when backup is set to Wi-Fi only), once
+  you're signed in with a library. A run lasts at most 20 minutes and shows a
+  quiet "Finding people in your photos" notification. It never starts while
+  the app is on screen and steps aside within a second when you open it,
+  unplug the phone, turn it off (Settings › People) or sign out; the page then
+  gets up to 30 s to save what it found.
+- **How:** the bundled web app's `runner/faces.html` runs in a private WebView
+  of its own (`https://appassets.androidplatform.net`, no Capacitor, storage
+  separate from the app's) that can only reach GitHub's API. It commits to
+  `manifest/faces.json` exactly like the app does.
+- **Fewer downloads:** photos this phone backed up (or saved from the library)
+  and hasn't changed since are read from the phone (`/_local/thumb/<mediaId>`,
+  an 800 px WebP made on the phone) instead of downloading their thumbnails
+  from GitHub.
+- **Without the battery exemption** Android may refuse the notification; the
+  run then goes on as a plain job and ends after 9 minutes.
+
 ## Save to phone and share
 
 From the gallery you can **save an original to the phone** (it appears in your
@@ -194,7 +219,8 @@ files under `android/app/src/main/res`.
 
 - `BackupPlugin` — the `Backup` Capacitor plugin used by the web app
   (`lib/native/backup.ts`): the GitHub session (`setAuth`/`getAuth`/`clearAuth`),
-  enable/disable, options, status and `itemsUploaded` events, save/share.
+  enable/disable, options, status and `itemsUploaded` events, save/share, and the
+  background People matching switch.
 - `ScanWorker`, `BackupScheduler` — content-URI-triggered and periodic scans.
 - `MediaScanner`, `BackupLedger` — MediaStore → SQLite ledger reconciliation.
 - `UploadWorker`, `MediaUploader`, `Thumbnails` — the upload engine.
@@ -206,6 +232,12 @@ files under `android/app/src/main/res`.
 - `JsJson` — JSON read and written exactly like the web app's JavaScript, so
   manifest diffs stay one line per item (unit-tested in `src/test`).
 - `MediaDownloader` — verified downloads for save-to-phone and share.
+- `FaceScanWorker` — background People matching: runs the web app's
+  `runner/faces.html` in a headless WebView (`setFaceScan`/`getFaceScanStatus`).
+  `FaceRunnerHost` is the page's `window.FaceRunnerHost` bridge (session,
+  limits, progress), `FaceRunnerAssets` serves the bundled export and this
+  phone's thumbnails on the runner's own origin, and `AppVisibility` tells it
+  when the app is on screen.
 
 ## Known limitations
 
@@ -219,6 +251,10 @@ files under `android/app/src/main/res`.
   notification for uploads that start in the background; the upload still runs,
   but Android can pause it after about 10 minutes. It resumes automatically
   where it stopped.
+- **Background People matching** shares the WebView renderer process with
+  the app's own screen. If Android kills that renderer (out of memory) while
+  the app is still in memory in the background, the whole app restarts; the
+  next run carries on.
 - **Debug build:** no auto-updates, and uninstalling clears local state
   (sign-in, backup settings, the ledger). Already backed-up photos are safe in
   GitHub; after reinstalling, items already in the library are recognised by

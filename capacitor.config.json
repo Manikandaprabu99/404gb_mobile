@@ -2,12 +2,12 @@
   "appId": "com.fourzerofourgb.app",
   "appName": "404GB",
   "webDir": "www",
-  "backgroundColor": "#060609",
+  "backgroundColor": "#0A0A0B",
   "server": {
     "androidScheme": "https"
   },
   "android": {
-    "backgroundColor": "#060609"
+    "backgroundColor": "#0A0A0B"
   },
   "plugins": {
     "SystemBars": {

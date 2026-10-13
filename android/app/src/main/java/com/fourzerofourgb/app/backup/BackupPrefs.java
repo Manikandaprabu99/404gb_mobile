@@ -33,6 +33,10 @@ final class BackupPrefs {
     private static final String KEY_AUTH_OWNER = "authOwner";
     private static final String KEY_AUTH_REPO = "authRepo";
     private static final String KEY_AUTH_BRANCH = "authBranch";
+    private static final String KEY_FACE_SCAN_ENABLED = "faceScanEnabled";
+    private static final String KEY_FACE_SCAN_LAST_RUN_AT = "faceScanLastRunAt";
+    private static final String KEY_FACE_SCAN_LAST_CHECKED = "faceScanLastChecked";
+    private static final String KEY_FACE_SCAN_LAST_ERROR = "faceScanLastError";
 
     /** The GitHub session the app and the background worker share (web: lib/native/backup.ts BackupAuth). */
     static final class Auth {
@@ -187,6 +191,26 @@ final class BackupPrefs {
         return token != null && token.equals(prefs.getString(KEY_AUTH_TOKEN, null));
     }
 
+    /** Background People matching (web: lib/native/backup.ts FaceScanStatus); on unless turned off. */
+    boolean faceScanEnabled() {
+        return prefs.getBoolean(KEY_FACE_SCAN_ENABLED, true);
+    }
+
+    /** When the last background People run ended (epoch ms); 0 before the first. */
+    long faceScanLastRunAt() {
+        return prefs.getLong(KEY_FACE_SCAN_LAST_RUN_AT, 0L);
+    }
+
+    /** Photos the last background People run checked. */
+    int faceScanLastChecked() {
+        return prefs.getInt(KEY_FACE_SCAN_LAST_CHECKED, 0);
+    }
+
+    /** Why the last background People run stopped early, or null. */
+    String faceScanLastError() {
+        return prefs.getString(KEY_FACE_SCAN_LAST_ERROR, null);
+    }
+
     void setOptions(boolean wifiOnly, boolean chargingOnly, String folders) {
         prefs
             .edit()
@@ -289,5 +313,28 @@ final class BackupPrefs {
 
     void setFolderBackfillDone(String library) {
         prefs.edit().putString(KEY_FOLDER_BACKFILL_DONE, library).apply();
+    }
+
+    void setFaceScanEnabled(boolean value) {
+        prefs.edit().putBoolean(KEY_FACE_SCAN_ENABLED, value).apply();
+    }
+
+    /** Records how a background People run ended; {@code error} null when it wasn't cut short. */
+    void setFaceScanResult(long endedAt, int checked, String error) {
+        SharedPreferences.Editor editor = prefs
+            .edit()
+            .putLong(KEY_FACE_SCAN_LAST_RUN_AT, endedAt)
+            .putInt(KEY_FACE_SCAN_LAST_CHECKED, Math.max(0, checked));
+        if (error == null) {
+            editor.remove(KEY_FACE_SCAN_LAST_ERROR);
+        } else {
+            editor.putString(KEY_FACE_SCAN_LAST_ERROR, error);
+        }
+        editor.apply();
+    }
+
+    /** Another library: the last run's numbers were about the previous one. */
+    void clearFaceScanResult() {
+        prefs.edit().remove(KEY_FACE_SCAN_LAST_RUN_AT).remove(KEY_FACE_SCAN_LAST_CHECKED).remove(KEY_FACE_SCAN_LAST_ERROR).apply();
     }
 }

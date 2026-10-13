@@ -34,7 +34,8 @@ import org.json.JSONObject;
 /**
  * JS bridge for native backup (web: lib/native/backup.ts). Backup itself runs
  * in WorkManager workers and keeps going with the app closed; this plugin
- * only configures it, reports status and handles save/share.
+ * only configures it, reports status and handles save/share. It also turns
+ * background People matching ({@link FaceScanWorker}) on and off.
  */
 @CapacitorPlugin(
     name = "Backup",
@@ -93,6 +94,8 @@ public class BackupPlugin extends Plugin {
             BackupScheduler.ensureScheduled(context);
             BackupScheduler.enqueueUpload(context, ExistingWorkPolicy.KEEP, 0);
         }
+        // Also brings back the schedule after a force-stop, with this build's constraints.
+        BackupScheduler.updateFaceScan(context);
         BackupStatus.changed(context);
     }
 
@@ -205,6 +208,10 @@ public class BackupPlugin extends Plugin {
         BackupNotifications.ensureChannels(context);
         BackupNotifications.clearSignInNeeded(context);
         BackupScheduler.ensureScheduled(context);
+        if (oldWifi != wifiOnly) {
+            // People matching follows backup's Wi-Fi choice.
+            BackupScheduler.updateFaceScan(context);
+        }
         if (!wasEnabled || oldWifi != wifiOnly || oldCharging != chargingOnly) {
             BackupScheduler.enqueueUpload(context, ExistingWorkPolicy.REPLACE, 0);
         } else {
@@ -255,6 +262,10 @@ public class BackupPlugin extends Plugin {
             return;
         }
         prefs.setOptions(wifiOnly, chargingOnly, folders);
+        if (wifiOnly != oldWifi) {
+            // People matching follows backup's Wi-Fi choice.
+            BackupScheduler.updateFaceScan(context);
+        }
         if (prefs.isEnabled()) {
             if (wifiOnly != oldWifi || chargingOnly != oldCharging) {
                 // New constraints only take effect on a new request.
@@ -330,6 +341,10 @@ public class BackupPlugin extends Plugin {
             prefs.setNeedsSignIn(false);
             prefs.setSignInNotified(false);
             BackupNotifications.clearSignInNeeded(context);
+            if (libraryChanged) {
+                prefs.clearFaceScanResult();
+            }
+            BackupScheduler.updateFaceScan(context);
             if (prefs.isEnabled() && auth.hasLibrary()) {
                 if (sessionChanged) {
                     // A run still using the old token or repo is replaced (it stops at its next request).
@@ -384,10 +399,36 @@ public class BackupPlugin extends Plugin {
             BackupNotifications.clearSignInNeeded(context);
             // Stop using the forgotten token right away; setAuth schedules uploads again.
             BackupScheduler.cancelUpload(context);
+            // Signed out: cancels background People matching (setAuth schedules it again).
+            BackupScheduler.updateFaceScan(context);
+            FaceScanWorker.forgetPageData();
             LibraryIndex.clear(context);
             call.resolve(BackupStatus.build(context));
             BackupStatus.changed(context);
         });
+    }
+
+    /**
+     * Background People matching on or off (on by default). It runs while the
+     * phone charges with the app closed, once signed in with a library.
+     */
+    @PluginMethod
+    public void setFaceScan(PluginCall call) {
+        Boolean enabled = call.getBoolean("enabled");
+        if (enabled == null) {
+            call.reject("enabled must be true or false", "INVALID_ARGUMENT");
+            return;
+        }
+        Context context = getContext();
+        BackupPrefs.get(context).setFaceScanEnabled(enabled);
+        // Turning it off cancels the work, which also stops a run that is going.
+        BackupScheduler.updateFaceScan(context);
+        call.resolve(FaceScanWorker.status(context));
+    }
+
+    @PluginMethod
+    public void getFaceScanStatus(PluginCall call) {
+        call.resolve(FaceScanWorker.status(getContext()));
     }
 
     @PluginMethod

@@ -45,7 +45,7 @@ final class Thumbnails {
     static List<Thumb> generate(Context context, Uri uri, boolean video, int orientation) {
         Bitmap source = null;
         try {
-            source = decode(context, uri, video, orientation);
+            source = decode(context, uri, video, orientation, SIZES[0]);
             if (source == null) {
                 return Collections.emptyList();
             }
@@ -77,15 +77,42 @@ final class Thumbnails {
         }
     }
 
-    private static Bitmap decode(Context context, Uri uri, boolean video, int orientation) throws IOException {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // MediaProvider's thumbnailer handles HEIC, EXIF rotation and video frames.
-            return context.getContentResolver().loadThumbnail(uri, new Size(1600, 1600), null);
+    /**
+     * One preview of at most {@code maxSide} px, made like those above (the
+     * background People runner's local thumbnails); null when it can't be made.
+     */
+    static byte[] single(Context context, Uri uri, boolean video, int orientation, int maxSide) {
+        Bitmap source = null;
+        Bitmap scaled = null;
+        try {
+            source = decode(context, uri, video, orientation, maxSide);
+            if (source == null) {
+                return null;
+            }
+            scaled = scaleToFit(source, maxSide);
+            return encode(scaled);
+        } catch (IOException | RuntimeException | OutOfMemoryError e) {
+            Log.w(TAG, "No preview for " + uri, e);
+            return null;
+        } finally {
+            if (scaled != null && scaled != source) {
+                scaled.recycle();
+            }
+            if (source != null) {
+                source.recycle();
+            }
         }
-        return video ? legacyVideoFrame(context, uri) : legacyImage(context.getContentResolver(), uri, orientation);
     }
 
-    private static Bitmap legacyImage(ContentResolver resolver, Uri uri, int orientation) throws IOException {
+    private static Bitmap decode(Context context, Uri uri, boolean video, int orientation, int maxSide) throws IOException {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // MediaProvider's thumbnailer handles HEIC, EXIF rotation and video frames.
+            return context.getContentResolver().loadThumbnail(uri, new Size(maxSide, maxSide), null);
+        }
+        return video ? legacyVideoFrame(context, uri, maxSide) : legacyImage(context.getContentResolver(), uri, orientation, maxSide);
+    }
+
+    private static Bitmap legacyImage(ContentResolver resolver, Uri uri, int orientation, int maxSide) throws IOException {
         BitmapFactory.Options bounds = new BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         try (InputStream in = resolver.openInputStream(uri)) {
@@ -99,7 +126,7 @@ final class Thumbnails {
         }
         int longest = Math.max(bounds.outWidth, bounds.outHeight);
         int sample = 1;
-        while (longest / (sample * 2) >= SIZES[0]) {
+        while (longest / (sample * 2) >= maxSide) {
             sample *= 2;
         }
         BitmapFactory.Options options = new BitmapFactory.Options();
@@ -123,14 +150,14 @@ final class Thumbnails {
         return rotated;
     }
 
-    private static Bitmap legacyVideoFrame(Context context, Uri uri) {
+    private static Bitmap legacyVideoFrame(Context context, Uri uri, int maxSide) {
         MediaMetadataRetriever retriever = new MediaMetadataRetriever();
         try {
             retriever.setDataSource(context, uri);
             long durationMs = parseLong(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION));
             long atUs = durationMs > 0 ? Math.min(1_000_000L, durationMs * 1000L / 2) : 0L;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                return retriever.getScaledFrameAtTime(atUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, SIZES[0], SIZES[0]);
+                return retriever.getScaledFrameAtTime(atUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, maxSide, maxSide);
             }
             return retriever.getFrameAtTime(atUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
         } catch (RuntimeException e) {

@@ -13,5 +13,7 @@
     <string name="backup_progress_title">Backing up %1$d of %2$d</string>
     <string name="backup_sign_in_title">Sign in to keep backing up</string>
     <string name="backup_sign_in_text">Open 404GB and sign in again so new photos and videos keep backing up.</string>
+    <string name="faces_progress_title">Finding people in your photos</string>
+    <string name="faces_progress_count">%1$s of %2$s photos</string>
     <string name="share_chooser_title">Share</string>
 </resources>

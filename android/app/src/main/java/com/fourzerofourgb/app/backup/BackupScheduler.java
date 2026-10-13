@@ -27,15 +27,20 @@ import java.util.concurrent.TimeoutException;
  *    Video collections; it re-arms itself every time it runs.
  *  - safety scan: periodic full rescan every 6 hours.
  *  - upload: the network/charging-constrained worker that drains the ledger.
+ *  - face scan: background People matching, hourly while charging. It doesn't
+ *    depend on backup being on, so cancelAll leaves it alone.
  */
 final class BackupScheduler {
 
     static final String WORK_MEDIA_TRIGGER = "404gb-backup-media-trigger";
     static final String WORK_SAFETY_SCAN = "404gb-backup-safety-scan";
     static final String WORK_UPLOAD = "404gb-backup-upload";
+    static final String WORK_FACE_SCAN = "404gb-faces-background";
 
     private static final String TAG = "404gb.BackupScheduler";
     private static final String WORK_TAG = "404gb-backup";
+    private static final String FACES_TAG = "404gb-faces";
+    private static final long FACE_SCAN_INTERVAL_MINUTES = 60;
 
     private BackupScheduler() {}
 
@@ -121,6 +126,32 @@ final class BackupScheduler {
     static void resumeAfterRateLimit(Context context, long delayMillis) {
         BackupPrefs.get(context).setResumeAt(System.currentTimeMillis() + delayMillis);
         enqueueUpload(context, ExistingWorkPolicy.REPLACE, delayMillis);
+    }
+
+    /**
+     * Background People matching ({@link FaceScanWorker}): scheduled while it is
+     * on and a GitHub session with a library is stored, cancelled otherwise
+     * (which stops a running run). About hourly, only while charging with the
+     * battery not low and online, on Wi-Fi when backup is Wi-Fi only. UPDATE
+     * keeps the schedule and never interrupts a run; new constraints apply from
+     * the next one.
+     */
+    static void updateFaceScan(Context context) {
+        BackupPrefs prefs = BackupPrefs.get(context);
+        if (!prefs.faceScanEnabled() || !prefs.canUpload()) {
+            WorkManager.getInstance(context).cancelUniqueWork(WORK_FACE_SCAN);
+            return;
+        }
+        Constraints constraints = new Constraints.Builder()
+            .setRequiredNetworkType(prefs.wifiOnly() ? NetworkType.UNMETERED : NetworkType.CONNECTED)
+            .setRequiresCharging(true)
+            .setRequiresBatteryNotLow(true)
+            .build();
+        PeriodicWorkRequest request = new PeriodicWorkRequest.Builder(FaceScanWorker.class, FACE_SCAN_INTERVAL_MINUTES, TimeUnit.MINUTES)
+            .setConstraints(constraints)
+            .addTag(FACES_TAG)
+            .build();
+        WorkManager.getInstance(context).enqueueUniquePeriodicWork(WORK_FACE_SCAN, ExistingPeriodicWorkPolicy.UPDATE, request);
     }
 
     static boolean isUploadRunning(Context context) {

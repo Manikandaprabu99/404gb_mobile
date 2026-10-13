@@ -10,10 +10,10 @@ import sharp from "sharp";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const res = path.join(root, "android", "app", "src", "main", "res");
 
-const BG = "#060609";
-const GRADIENT =
-  '<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">' +
-  '<stop offset="0" stop-color="#a5b4fc"/><stop offset="1" stop-color="#6366f1"/></linearGradient>';
+// The "Missing Tile" palette (web app docs/DESIGN.md): ink background, signal-lime tiles
+// and a dashed lime outline for the missing one.
+const BG = "#0A0A0B";
+const LIME = "#C8F542";
 const TILES = [
   { x: 232, y: 232, s: 256, r: 64 },
   { x: 232, y: 536, s: 256, r: 64 },
@@ -31,14 +31,13 @@ const DENSITIES = { mdpi: 1, hdpi: 1.5, xhdpi: 2, xxhdpi: 3, xxxhdpi: 4 };
 
 const tilesMarkup = () =>
   TILES.map(
-    (t) => `<rect x="${t.x}" y="${t.y}" width="${t.s}" height="${t.s}" rx="${t.r}" fill="url(#g)"/>`
+    (t) => `<rect x="${t.x}" y="${t.y}" width="${t.s}" height="${t.s}" rx="${t.r}" fill="${LIME}"/>`
   ).join("") +
   `<rect x="${MISSING.x}" y="${MISSING.y}" width="${MISSING.s}" height="${MISSING.s}" rx="${MISSING.r}" ` +
-  `fill="none" stroke="#818cf8" stroke-width="${MISSING.stroke}" stroke-dasharray="${MISSING.dash} ${MISSING.gap}"/>`;
+  `fill="none" stroke="${LIME}" stroke-width="${MISSING.stroke}" stroke-dasharray="${MISSING.dash} ${MISSING.gap}"/>`;
 
 const svgDoc = (px, body) =>
-  `<svg xmlns="http://www.w3.org/2000/svg" width="${px}" height="${px}" viewBox="0 0 1024 1024">` +
-  `<defs>${GRADIENT}</defs>${body}</svg>`;
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${px}" height="${px}" viewBox="0 0 1024 1024">${body}</svg>`;
 
 const roundIcon = (px) => svgDoc(px, `<circle cx="512" cy="512" r="512" fill="${BG}"/>${tilesMarkup()}`);
 const safeTiles = (px) =>
