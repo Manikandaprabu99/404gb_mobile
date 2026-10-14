@@ -34,8 +34,8 @@ import org.json.JSONObject;
 /**
  * JS bridge for native backup (web: lib/native/backup.ts). Backup itself runs
  * in WorkManager workers and keeps going with the app closed; this plugin
- * only configures it, reports status and handles save/share. It also turns
- * background People matching ({@link FaceScanWorker}) on and off.
+ * only configures it, reports status and handles save/share. It also sets up
+ * background People matching ({@link FaceScanWorker}).
  */
 @CapacitorPlugin(
     name = "Backup",
@@ -408,20 +408,19 @@ public class BackupPlugin extends Plugin {
         });
     }
 
-    /**
-     * Background People matching on or off (on by default). It runs while the
-     * phone charges with the app closed, once signed in with a library.
-     */
+    /** setFaceScan({enabled?, chargingOnly?}): background People matching on/off and "Only while charging". */
     @PluginMethod
     public void setFaceScan(PluginCall call) {
-        Boolean enabled = call.getBoolean("enabled");
-        if (enabled == null) {
-            call.reject("enabled must be true or false", "INVALID_ARGUMENT");
+        Context context = getContext();
+        BackupPrefs prefs = BackupPrefs.get(context);
+        Boolean enabled = call.hasOption("enabled") ? call.getBoolean("enabled") : Boolean.valueOf(prefs.faceScanEnabled());
+        Boolean chargingOnly = call.hasOption("chargingOnly") ? call.getBoolean("chargingOnly") : Boolean.valueOf(prefs.faceScanChargingOnly());
+        if (enabled == null || chargingOnly == null || (!call.hasOption("enabled") && !call.hasOption("chargingOnly"))) {
+            call.reject("enabled and chargingOnly must be true or false", "INVALID_ARGUMENT");
             return;
         }
-        Context context = getContext();
-        BackupPrefs.get(context).setFaceScanEnabled(enabled);
-        // Turning it off cancels the work, which also stops a run that is going.
+        prefs.setFaceScan(enabled, chargingOnly);
+        // Off cancels the work (stopping a run that is going); new constraints apply from the next run.
         BackupScheduler.updateFaceScan(context);
         call.resolve(FaceScanWorker.status(context));
     }

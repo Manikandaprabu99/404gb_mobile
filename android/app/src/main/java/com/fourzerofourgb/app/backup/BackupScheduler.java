@@ -27,8 +27,7 @@ import java.util.concurrent.TimeoutException;
  *    Video collections; it re-arms itself every time it runs.
  *  - safety scan: periodic full rescan every 6 hours.
  *  - upload: the network/charging-constrained worker that drains the ledger.
- *  - face scan: background People matching, hourly while charging. It doesn't
- *    depend on backup being on, so cancelAll leaves it alone.
+ *  - face scan: People matching, hourly plus a one-time "soon"/follow-up run; cancelAll leaves it alone.
  */
 final class BackupScheduler {
 
@@ -36,6 +35,7 @@ final class BackupScheduler {
     static final String WORK_SAFETY_SCAN = "404gb-backup-safety-scan";
     static final String WORK_UPLOAD = "404gb-backup-upload";
     static final String WORK_FACE_SCAN = "404gb-faces-background";
+    static final String WORK_FACE_SCAN_SOON = "404gb-faces-soon";
 
     private static final String TAG = "404gb.BackupScheduler";
     private static final String WORK_TAG = "404gb-backup";
@@ -128,30 +128,86 @@ final class BackupScheduler {
         enqueueUpload(context, ExistingWorkPolicy.REPLACE, delayMillis);
     }
 
-    /**
-     * Background People matching ({@link FaceScanWorker}): scheduled while it is
-     * on and a GitHub session with a library is stored, cancelled otherwise
-     * (which stops a running run). About hourly, only while charging with the
-     * battery not low and online, on Wi-Fi when backup is Wi-Fi only. UPDATE
-     * keeps the schedule and never interrupts a run; new constraints apply from
-     * the next one.
-     */
+    /** The hourly People run while it is on and a library is set, else cancels all People work. UPDATE never interrupts a run. */
     static void updateFaceScan(Context context) {
         BackupPrefs prefs = BackupPrefs.get(context);
-        if (!prefs.faceScanEnabled() || !prefs.canUpload()) {
-            WorkManager.getInstance(context).cancelUniqueWork(WORK_FACE_SCAN);
+        WorkManager manager = WorkManager.getInstance(context);
+        if (!faceScanAllowed(prefs)) {
+            manager.cancelUniqueWork(WORK_FACE_SCAN);
+            manager.cancelUniqueWork(WORK_FACE_SCAN_SOON);
             return;
         }
-        Constraints constraints = new Constraints.Builder()
-            .setRequiredNetworkType(prefs.wifiOnly() ? NetworkType.UNMETERED : NetworkType.CONNECTED)
-            .setRequiresCharging(true)
-            .setRequiresBatteryNotLow(true)
-            .build();
         PeriodicWorkRequest request = new PeriodicWorkRequest.Builder(FaceScanWorker.class, FACE_SCAN_INTERVAL_MINUTES, TimeUnit.MINUTES)
-            .setConstraints(constraints)
+            .setConstraints(faceScanConstraints(prefs))
+            .setInputData(faceScanInput(FaceScanWorker.TRIGGER_PERIODIC))
             .addTag(FACES_TAG)
             .build();
-        WorkManager.getInstance(context).enqueueUniquePeriodicWork(WORK_FACE_SCAN, ExistingPeriodicWorkPolicy.UPDATE, request);
+        manager.enqueueUniquePeriodicWork(WORK_FACE_SCAN, ExistingPeriodicWorkPolicy.UPDATE, request);
+    }
+
+    /** A one-time People run about 90 s from now (app closed, or new photos backed up); KEEP. */
+    static void faceScanSoon(Context context, String trigger) {
+        enqueueFaceScanOnce(context, ExistingWorkPolicy.KEEP, FaceScanPolicy.SOON_DELAY_MS, trigger);
+    }
+
+    /** Another run after {@code delayMillis}, from inside a run: APPEND_OR_REPLACE chains it instead of cancelling this one. */
+    static void faceScanFollowUp(Context context, long delayMillis) {
+        enqueueFaceScanOnce(context, ExistingWorkPolicy.APPEND_OR_REPLACE, delayMillis, FaceScanWorker.TRIGGER_FOLLOW_UP);
+    }
+
+    /** The app is on screen again: its own scanner takes over (a run going now is stopped). */
+    static void cancelFaceScanSoon(Context context) {
+        WorkManager.getInstance(context).cancelUniqueWork(WORK_FACE_SCAN_SOON);
+    }
+
+    /** A "soon" or follow-up run is queued (not running yet). */
+    static boolean isFaceScanPending(Context context) {
+        try {
+            List<WorkInfo> infos = WorkManager.getInstance(context).getWorkInfosForUniqueWork(WORK_FACE_SCAN_SOON).get(2, TimeUnit.SECONDS);
+            for (WorkInfo info : infos) {
+                WorkInfo.State state = info.getState();
+                if (state == WorkInfo.State.ENQUEUED || state == WorkInfo.State.BLOCKED) {
+                    return true;
+                }
+            }
+        } catch (ExecutionException | TimeoutException e) {
+            Log.w(TAG, "Could not read People work state", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return false;
+    }
+
+    private static void enqueueFaceScanOnce(Context context, ExistingWorkPolicy policy, long delayMillis, String trigger) {
+        BackupPrefs prefs = BackupPrefs.get(context);
+        // GitHub refused the token: nothing to do until the app has a new sign-in.
+        if (!faceScanAllowed(prefs) || prefs.needsSignIn()) {
+            return;
+        }
+        OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(FaceScanWorker.class)
+            .setConstraints(faceScanConstraints(prefs))
+            .setInputData(faceScanInput(trigger))
+            .setInitialDelay(Math.max(0L, delayMillis), TimeUnit.MILLISECONDS)
+            .addTag(FACES_TAG)
+            .build();
+        WorkManager.getInstance(context).enqueueUniqueWork(WORK_FACE_SCAN_SOON, policy, request);
+    }
+
+    private static boolean faceScanAllowed(BackupPrefs prefs) {
+        return prefs.faceScanEnabled() && prefs.canUpload();
+    }
+
+    /** Online (Wi-Fi if backup is Wi-Fi only), battery not low, charging only if "Only while charging". */
+    private static Constraints faceScanConstraints(BackupPrefs prefs) {
+        return new Constraints.Builder()
+            .setRequiredNetworkType(prefs.wifiOnly() ? NetworkType.UNMETERED : NetworkType.CONNECTED)
+            .setRequiresCharging(prefs.faceScanChargingOnly())
+            .setRequiresBatteryNotLow(true)
+            .build();
+    }
+
+    private static Data faceScanInput(String trigger) {
+        return new Data.Builder().putString(FaceScanWorker.KEY_TRIGGER, trigger).build();
     }
 
     static boolean isUploadRunning(Context context) {

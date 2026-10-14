@@ -51,6 +51,9 @@ final class FaceRunnerAssets {
     private final WebViewAssetLoader loader;
     private final AtomicInteger localServed = new AtomicInteger();
     private final AtomicInteger localMissed = new AtomicInteger();
+    private final AtomicInteger bundledServed = new AtomicInteger();
+    private final AtomicInteger bundledMissing = new AtomicInteger();
+    private volatile String firstMissing;
 
     FaceRunnerAssets(Context context) {
         this.context = context.getApplicationContext();
@@ -59,7 +62,7 @@ final class FaceRunnerAssets {
         loader = new WebViewAssetLoader.Builder()
             .setDomain(DOMAIN)
             .addPathHandler(LOCAL_THUMB_PATH, this::localThumbnail)
-            .addPathHandler("/", path -> bundled(assets, path))
+            .addPathHandler("/", path -> counted(path, bundled(assets, path)))
             .build();
     }
 
@@ -123,6 +126,29 @@ final class FaceRunnerAssets {
 
     int localMissed() {
         return localMissed.get();
+    }
+
+    int bundledServed() {
+        return bundledServed.get();
+    }
+
+    int bundledMissing() {
+        return bundledMissing.get();
+    }
+
+    /** The first bundled path that wasn't in the export, for the run's log. */
+    String firstMissing() {
+        return firstMissing;
+    }
+
+    private WebResourceResponse counted(String path, WebResourceResponse response) {
+        // A file response made without a status reports 0, not 200; misses are notFound()'s 404.
+        if (response.getStatusCode() != 404) {
+            bundledServed.incrementAndGet();
+        } else if (bundledMissing.getAndIncrement() == 0) {
+            firstMissing = path;
+        }
+        return response;
     }
 
     private static WebResourceResponse bundled(AssetManager assets, String path) {

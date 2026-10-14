@@ -19,14 +19,16 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     public void onStart() {
-        // First, so a background People run starts stepping aside right away.
-        AppVisibility.onStart();
+        // First, so a background People run starts stepping aside right away
+        // (and a queued one is cancelled: the app's own scanner takes over).
+        AppVisibility.onStart(getApplicationContext());
         super.onStart();
     }
 
     @Override
     public void onStop() {
         super.onStop();
-        AppVisibility.onStop();
+        // Queues a People run about 90 s from now, so matching goes on with the app closed.
+        AppVisibility.onStop(getApplicationContext());
     }
 }

@@ -105,27 +105,40 @@ while the battery is low.
 ## People matching in the background
 
 The app finds faces in your photos on the phone (the web repo's
-`docs/FACES.md`). While the app is open its own scanner does that; while the
-phone **charges with the app closed**, the same scanner keeps going in the
-background, so a big library doesn't need the app left open for days:
+`docs/FACES.md`). While the app is open its own scanner does that; **after you
+close it**, the same scanner keeps going in the background, so a big library
+doesn't need the app left open for days. Settings › People has two switches:
+**Find people in the background** (on by default) and **Only while charging**
+(off by default).
 
-- **When:** about once an hour (WorkManager), only while charging with the
-  battery not low and online (on Wi-Fi when backup is set to Wi-Fi only), once
-  you're signed in with a library. A run lasts at most 20 minutes and shows a
-  quiet "Finding people in your photos" notification. It never starts while
-  the app is on screen and steps aside within a second when you open it,
-  unplug the phone, turn it off (Settings › People) or sign out; the page then
-  gets up to 30 s to save what it found.
+- **When:** about 90 seconds after you close the app (or switch to another
+  one), after backup uploads new photos while the app is closed, right after a
+  run that ran out of time with photos left (about a minute later while
+  charging, 20 minutes on battery), and about once an hour as a safety net.
+  Always online (on Wi-Fi when backup is set to Wi-Fi only), never while the
+  battery is low, and only once you're signed in with a library.
+- **On battery** (unless "Only while charging" is on): runs last at most 8
+  minutes and only go ahead with at least 30 % battery and Battery Saver off;
+  while charging a run lasts up to 20 minutes. A quiet "Finding people in your
+  photos" notification shows while it runs.
+- **Stepping aside:** a run never starts while the app is on screen and stops
+  within a second when you open it, turn it off, sign out, or the battery
+  drops under 30 % unplugged; the page then gets up to 30 s to save what it
+  found.
 - **How:** the bundled web app's `runner/faces.html` runs in a private WebView
   of its own (`https://appassets.androidplatform.net`, no Capacitor, storage
-  separate from the app's) that can only reach GitHub's API. It commits to
-  `manifest/faces.json` exactly like the app does.
+  separate from the app's) that can only reach GitHub's API, on the
+  WebAssembly backend. It commits to `manifest/faces.json` exactly like the
+  app does.
 - **Fewer downloads:** photos this phone backed up (or saved from the library)
   and hasn't changed since are read from the phone (`/_local/thumb/<mediaId>`,
   an 800 px WebP made on the phone) instead of downloading their thumbnails
   from GitHub.
 - **Without the battery exemption** Android may refuse the notification; the
-  run then goes on as a plain job and ends after 9 minutes.
+  run then goes on as a plain job and ends after 9 minutes (8 on battery).
+- **Checking it:** Settings › People shows "Running now · 120 checked", "Last
+  run 10:42 · 35 photos checked", or why the last run stopped or was skipped.
+  `adb logcat -s 404gb.FaceScanWorker` logs every decision.
 
 ## Save to phone and share
 
@@ -144,7 +157,8 @@ as already backed up, so it's never uploaded again.
 | Notifications (Android 13+) | Upload progress and the "sign in" alert. Optional: backup works without it. |
 | Battery optimization exemption | Asked once. Lets Android run backups promptly and show the progress notification while the app is in the background. |
 | Storage write (Android 9 and older only) | Saving originals into Pictures/Movies. |
-| Foreground service (data sync), internet | Running long uploads reliably. |
+| Foreground service (data sync), internet | Running long uploads (and People matching) reliably. |
+| Vibrate | Haptic feedback in the app (granted at install). |
 
 **Android 14+ "Select photos and videos":** if you grant access to only some
 items, backup can't see the rest. The status shows "needs permission"; turn
@@ -233,11 +247,12 @@ files under `android/app/src/main/res`.
   manifest diffs stay one line per item (unit-tested in `src/test`).
 - `MediaDownloader` — verified downloads for save-to-phone and share.
 - `FaceScanWorker` — background People matching: runs the web app's
-  `runner/faces.html` in a headless WebView (`setFaceScan`/`getFaceScanStatus`).
+  `runner/faces.html` in a headless WebView (`setFaceScan`/`getFaceScanStatus`);
+  `FaceScanPolicy` decides when a run may go ahead, how long, and the follow-up.
   `FaceRunnerHost` is the page's `window.FaceRunnerHost` bridge (session,
   limits, progress), `FaceRunnerAssets` serves the bundled export and this
   phone's thumbnails on the runner's own origin, and `AppVisibility` tells it
-  when the app is on screen.
+  when the app is on screen and queues a run when the app is closed.
 
 ## Known limitations
 

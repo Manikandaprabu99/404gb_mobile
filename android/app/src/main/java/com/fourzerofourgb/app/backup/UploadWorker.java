@@ -293,6 +293,7 @@ public final class UploadWorker extends Worker {
         List<Map<String, Object>> added = result.addedEntries();
         if (!added.isEmpty()) {
             emitItemsUploaded(added);
+            matchNewPhotosSoon();
         }
         BackupStatus.changed(context);
     }
@@ -308,6 +309,19 @@ public final class UploadWorker extends Worker {
             array.put(LibraryWriter.toJsObject(entry));
         }
         plugin.emitItemsUploaded(array);
+    }
+
+    /** New photos in the library with the app closed: a People run about 90 s later finds faces in them. */
+    private void matchNewPhotosSoon() {
+        FaceScanWorker.noteUploaded();
+        if (AppVisibility.isVisible()) {
+            return;
+        }
+        try {
+            BackupScheduler.faceScanSoon(context, FaceScanWorker.TRIGGER_UPLOADED);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Could not queue a People run", e);
+        }
     }
 
     /** A session stored without a branch: use (and remember) the repo's default branch. */

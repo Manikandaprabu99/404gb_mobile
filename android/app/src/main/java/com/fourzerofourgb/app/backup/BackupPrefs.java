@@ -37,6 +37,8 @@ final class BackupPrefs {
     private static final String KEY_FACE_SCAN_LAST_RUN_AT = "faceScanLastRunAt";
     private static final String KEY_FACE_SCAN_LAST_CHECKED = "faceScanLastChecked";
     private static final String KEY_FACE_SCAN_LAST_ERROR = "faceScanLastError";
+    private static final String KEY_FACE_SCAN_LAST_REASON = "faceScanLastReason";
+    private static final String KEY_FACE_SCAN_CHARGING_ONLY = "faceScanChargingOnly";
 
     /** The GitHub session the app and the background worker share (web: lib/native/backup.ts BackupAuth). */
     static final class Auth {
@@ -211,6 +213,16 @@ final class BackupPrefs {
         return prefs.getString(KEY_FACE_SCAN_LAST_ERROR, null);
     }
 
+    /** FaceScanStatus.lastReason: "done", "deadline", "stopped", "error" or a FaceScanPolicy skip reason. */
+    String faceScanLastReason() {
+        return prefs.getString(KEY_FACE_SCAN_LAST_REASON, null);
+    }
+
+    /** Background People matching only while the phone charges (off unless turned on). */
+    boolean faceScanChargingOnly() {
+        return prefs.getBoolean(KEY_FACE_SCAN_CHARGING_ONLY, false);
+    }
+
     void setOptions(boolean wifiOnly, boolean chargingOnly, String folders) {
         prefs
             .edit()
@@ -315,12 +327,13 @@ final class BackupPrefs {
         prefs.edit().putString(KEY_FOLDER_BACKFILL_DONE, library).apply();
     }
 
-    void setFaceScanEnabled(boolean value) {
-        prefs.edit().putBoolean(KEY_FACE_SCAN_ENABLED, value).apply();
+    /** Written synchronously: the scheduler reads it right after. */
+    void setFaceScan(boolean enabled, boolean chargingOnly) {
+        prefs.edit().putBoolean(KEY_FACE_SCAN_ENABLED, enabled).putBoolean(KEY_FACE_SCAN_CHARGING_ONLY, chargingOnly).commit();
     }
 
     /** Records how a background People run ended; {@code error} null when it wasn't cut short. */
-    void setFaceScanResult(long endedAt, int checked, String error) {
+    void setFaceScanResult(long endedAt, int checked, String error, String reason) {
         SharedPreferences.Editor editor = prefs
             .edit()
             .putLong(KEY_FACE_SCAN_LAST_RUN_AT, endedAt)
@@ -330,11 +343,27 @@ final class BackupPrefs {
         } else {
             editor.putString(KEY_FACE_SCAN_LAST_ERROR, error);
         }
+        if (reason == null) {
+            editor.remove(KEY_FACE_SCAN_LAST_REASON);
+        } else {
+            editor.putString(KEY_FACE_SCAN_LAST_REASON, reason);
+        }
         editor.apply();
+    }
+
+    /** A run that was due but didn't go ahead (battery, Battery Saver): the last run's numbers stay. */
+    void setFaceScanSkipped(String reason) {
+        prefs.edit().putString(KEY_FACE_SCAN_LAST_REASON, reason).apply();
     }
 
     /** Another library: the last run's numbers were about the previous one. */
     void clearFaceScanResult() {
-        prefs.edit().remove(KEY_FACE_SCAN_LAST_RUN_AT).remove(KEY_FACE_SCAN_LAST_CHECKED).remove(KEY_FACE_SCAN_LAST_ERROR).apply();
+        prefs
+            .edit()
+            .remove(KEY_FACE_SCAN_LAST_RUN_AT)
+            .remove(KEY_FACE_SCAN_LAST_CHECKED)
+            .remove(KEY_FACE_SCAN_LAST_ERROR)
+            .remove(KEY_FACE_SCAN_LAST_REASON)
+            .apply();
     }
 }
